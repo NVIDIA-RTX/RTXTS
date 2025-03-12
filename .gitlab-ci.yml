@@ -1,0 +1,19 @@
+stages:
+  - build
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+build-windows:
+  stage: build
+  tags:
+    - os/win11
+  script:
+    - mkdir build
+    - cd build
+    - cmake .. -DCMAKE_BUILD_TYPE=Release
+    - cmake --build .
+  # artifacts:
+  #   name: "memo-windows-${CI_COMMIT_SHORT_SHA}"
+  #   paths:
+  #     - bin
