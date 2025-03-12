@@ -1,0 +1,7 @@
+[submodule "donut"]
+	path = donut
+	url = https://github.com/NVIDIA-RTX/Donut
+	branch = main
+[submodule "rtxts-ttm"]
+	path = libraries/rtxts-ttm
+	url = ../RTXTS-TTM
