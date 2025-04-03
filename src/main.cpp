@@ -42,7 +42,7 @@
 #include <nvrhi/common/misc.h>
 
 // NOTE: This is currently required to talk directly to the d3d12 commandlist for requireTextureState and commitBarriers
-#include "../donut/nvrhi/src/d3d12/d3d12-backend.h"
+#include "../external/donut/nvrhi/src/d3d12/d3d12-backend.h"
 
 #include <string>
 #include <vector>
@@ -307,6 +307,7 @@ struct UIData
     int                                 texturesPerFrame = 10;
     int                                 tilesPerFrame = 256;
     int                                 tileTimeout = 2;
+    int                                 maxStandbyTiles = 1000;
 };
 
 enum TextureState
@@ -353,7 +354,7 @@ public:
         return m_maxTiles;
     }
 
-    bool UploadTile(ID3D12GraphicsCommandList* commandList, ID3D12Resource* destTexture, nvfeedback::FeedbackTextureTile tile, const char* dataMipBase, nvrhi::TileShape tileShape, uint32_t rowPitchSource)
+    bool UploadTile(ID3D12GraphicsCommandList* commandList, ID3D12Resource* destTexture, nvfeedback::FeedbackTextureTileInfo tile, const char* dataMipBase, nvrhi::TileShape tileShape, uint32_t rowPitchSource)
     {
         uint32_t& tileCount = m_tileCount[m_frameIndex];
         if (tileCount >= m_maxTiles)
@@ -367,13 +368,13 @@ public:
 
         // Compute pitches and offsets in 4x4 blocks
         // Note: The "tile" being copied here might be smaller than a tiled resource tile, for example non-pow2 textures
-        uint32_t tileBlocksWidth = tile.width / 4;
-        uint32_t tileBlocksHeight = tile.height / 4;
+        uint32_t tileBlocksWidth = tile.widthInTexels / 4;
+        uint32_t tileBlocksHeight = tile.heightInTexels / 4;
         uint32_t shapeBlocksWidth = tileShape.widthInTexels / 4;
         uint32_t shapeBlocksHeight = tileShape.heightInTexels / 4;
         uint32_t bytesPerBlock = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES / (shapeBlocksWidth * shapeBlocksHeight);
-        uint32_t sourceBlockX = tile.x / 4;
-        uint32_t sourceBlockY = tile.y / 4;
+        uint32_t sourceBlockX = tile.xInTexels / 4;
+        uint32_t sourceBlockY = tile.yInTexels / 4;
         uint32_t rowPitchTile = tileBlocksWidth * bytesPerBlock;
         for (uint32_t blockRow = 0; blockRow < tileBlocksHeight; blockRow++)
         {
@@ -389,8 +390,8 @@ public:
         srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         srcLocation.PlacedFootprint.Offset = bufferOffset;
         srcLocation.PlacedFootprint.Footprint.Format = destTexture->GetDesc().Format;
-        srcLocation.PlacedFootprint.Footprint.Width = tile.width;
-        srcLocation.PlacedFootprint.Footprint.Height = tile.height;
+        srcLocation.PlacedFootprint.Footprint.Width = tile.widthInTexels;
+        srcLocation.PlacedFootprint.Footprint.Height = tile.heightInTexels;
         srcLocation.PlacedFootprint.Footprint.Depth = 1;
         srcLocation.PlacedFootprint.Footprint.RowPitch = rowPitchTile;
 
@@ -403,11 +404,11 @@ public:
         sourceBox.left = 0;
         sourceBox.top = 0;
         sourceBox.front = 0;
-        sourceBox.right = tile.width;
-        sourceBox.bottom = tile.height;
+        sourceBox.right = tile.widthInTexels;
+        sourceBox.bottom = tile.heightInTexels;
         sourceBox.back = 1;
 
-        commandList->CopyTextureRegion(&dstLocation, tile.x, tile.y, 0, &srcLocation, &sourceBox);
+        commandList->CopyTextureRegion(&dstLocation, tile.xInTexels, tile.yInTexels, 0, &srcLocation, &sourceBox);
 
         return true;
     }
@@ -426,7 +427,6 @@ struct RequestedTile
 {
     nvfeedback::FeedbackTexture* texture;
     uint32_t tileIndex;
-    nvfeedback::FeedbackTextureTile tile;
 };
 
 class SampleApp : public ApplicationBase
@@ -1026,6 +1026,7 @@ public:
             fconfig.tileTimeoutSeconds = (float)std::max(m_ui.tileTimeout, 0);
             fconfig.defragmentHeaps = m_ui.defragmentHeaps;
             fconfig.releaseEmptyHeaps = m_ui.releaseEmptyHeaps;
+            fconfig.maxStandbyTiles = m_ui.maxStandbyTiles;
             m_feedbackManager->BeginFrame(m_commandList, fconfig, &updatedTextures);
 
             // Collect all tiles and store them in the queue
@@ -1033,11 +1034,10 @@ public:
             {
                 RequestedTile reqTile;
                 reqTile.texture = texUpdate.texture;
-                for (uint32_t i = 0; i < texUpdate.tiles.size(); i++)
+                for (uint32_t i = 0; i < texUpdate.tileIndices.size(); i++)
                 {
-                    reqTile.tile = texUpdate.tiles[i];
                     reqTile.tileIndex = texUpdate.tileIndices[i];
-                    if (reqTile.tile.isPacked)
+                    if (texUpdate.texture->IsTilePacked(reqTile.tileIndex))
                         requestedPackedTiles.push_back(reqTile);
                     else
                         m_requestedTiles.push(reqTile);
@@ -1079,15 +1079,6 @@ public:
                     pTexUpdate = &tilesThisFrame.textures.back();
                 }
 
-                if (!reqTile.tile.isPacked)
-                {
-                    for (uint32_t t = 0; t < pTexUpdate->tileIndices.size(); t++)
-                    {
-                        assert(pTexUpdate->tileIndices[t] != reqTile.tileIndex);
-                    }
-                }
-
-                pTexUpdate->tiles.push_back(reqTile.tile);
                 pTexUpdate->tileIndices.push_back(reqTile.tileIndex);
             };
 
@@ -1119,6 +1110,8 @@ public:
             m_commandList->open();
             ID3D12GraphicsCommandList* pCommandList = m_commandList->getNativeObject(nvrhi::ObjectTypes::D3D12_GraphicsCommandList);
 
+            std::vector<nvfeedback::FeedbackTextureTileInfo> tiles;
+
             for (FeedbackTextureUpdate& texUpdate : tilesThisFrame.textures)
             {
                 auto& wrapper = m_feedbackTextureMaps.m_feedbackTexturesByFeedback[texUpdate.texture];
@@ -1141,24 +1134,28 @@ public:
                 auto& textureData = wrapper->m_sourceTexture;
                 ID3D12Resource* pResource = reservedTexture->getNativeObject(nvrhi::ObjectTypes::D3D12_Resource);
 
-                for (auto& tile : texUpdate.tiles)
+                for (auto& tileIndex : texUpdate.tileIndices)
                 {
-                    if (tile.isPacked)
+                    texUpdate.texture->GetTileInfo(tileIndex, tiles);
+                    for (auto& tile : tiles)
                     {
-                        // Flexible, but slower, path for uploading packed mips
-                        const TextureSubresourceData& layout = textureData->dataLayout[0][tile.mip];
-                        const char* dataPointer = static_cast<const char*>(textureData->data->data());
+                        if (texUpdate.texture->IsTilePacked(tileIndex))
+                        {
+                            // Flexible, but slower, path for uploading packed mips
+                            const TextureSubresourceData& layout = textureData->dataLayout[0][tile.mip];
+                            const char* dataPointer = static_cast<const char*>(textureData->data->data());
 
-                        m_commandList->writeTexture(reservedTexture, 0, tile.mip, dataPointer + layout.dataOffset,
-                            layout.rowPitch, layout.depthPitch);
-                    }
-                    else
-                    {
-                        // More efficient path for uploading regular tiles
-                        const TextureSubresourceData& layout = textureData->dataLayout[0][tile.mip];
-                        const char* mipBase = static_cast<const char*>(textureData->data->data()) + layout.dataOffset;
-                        bool uploadSuccess = m_tileUploadHelper.UploadTile(pCommandList, pResource, tile, mipBase, tileShape,(uint32_t)layout.rowPitch);
-                        assert(uploadSuccess);
+                            m_commandList->writeTexture(reservedTexture, 0, tile.mip, dataPointer + layout.dataOffset,
+                                layout.rowPitch, layout.depthPitch);
+                        }
+                        else
+                        {
+                            // More efficient path for uploading regular tiles
+                            const TextureSubresourceData& layout = textureData->dataLayout[0][tile.mip];
+                            const char* mipBase = static_cast<const char*>(textureData->data->data()) + layout.dataOffset;
+                            bool uploadSuccess = m_tileUploadHelper.UploadTile(pCommandList, pResource, tile, mipBase, tileShape,(uint32_t)layout.rowPitch);
+                            assert(uploadSuccess);
+                        }
                     }
                 }
             }
@@ -1661,25 +1658,28 @@ protected:
         ImGui::SliderInt("Textures Per Frame", &m_ui.texturesPerFrame, 0, 32);
         ImGui::SliderInt("Tiles Per Frame", &m_ui.tilesPerFrame, 1, 100);
         ImGui::SliderInt("Tile Timeout Seconds", &m_ui.tileTimeout, 0, 10);
+        ImGui::SliderInt("Max Standby Tiles", &m_ui.maxStandbyTiles, 0, 2000);
 
         ImGui::Separator();
+        constexpr double mebibyte = 1024 * 1024;
         ImGui::Text("Tiled Textures: %d / %d", m_app->m_feedbackTextureMaps.m_feedbackTexturesByName.size(), m_app->GetTextureCache()->GetNumberOfLoadedTextures());
-        double tilesTotalMb = double(uint64_t(stats.tilesTotal) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / 1000000.0;
-        ImGui::Text("Tiles Total: %d (%.0fMB)", stats.tilesTotal, tilesTotalMb);
-        ImGui::Text("Tiles Allocated: %d (%.0fMB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated)* uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / 1000000.0);
+        double tilesTotalMibs = double(uint64_t(stats.tilesTotal) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte;
+        ImGui::Text("Tiles Total: %d (%.0f MiB)", stats.tilesTotal, tilesTotalMibs);
+        ImGui::Text("Tiles Allocated: %d (%.0f MiB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte);
+        ImGui::Text("Tiles Standby: %d (%.0f MiB)", stats.tilesStandby, double(uint64_t(stats.tilesStandby) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte);
 #if PROFILE
-        ImGui::Text("Tiles Requested: %d (%.0fMB)", stats.tilesRequested, double(uint64_t(stats.tilesRequested) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / 1000000.0);
+        ImGui::Text("Tiles Requested: %d (%.0f MiB)", stats.tilesRequested, double(uint64_t(stats.tilesRequested) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte);
         ImGui::Text("Tiles Idle: %d", stats.tilesIdle);
 #endif // PROFILE
-        double tilesHeapAllocatedMb = double(stats.heapAllocationInBytes) / 1000000.0;
-        ImGui::Text("Heap Allocation: %.0fMB", tilesHeapAllocatedMb);
+        double tilesHeapAllocatedMib = double(stats.heapAllocationInBytes) / mebibyte;
+        ImGui::Text("Heap Allocation: %.0f MiB", tilesHeapAllocatedMib);
         
         ImGui::Separator();
 
         if (stats.tilesTotal)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 255, 0, 255));
-            ImGui::Text("Memory Savings: %.2fx (%.0fMB)", tilesTotalMb / tilesHeapAllocatedMb, tilesTotalMb - tilesHeapAllocatedMb);
+            ImGui::Text("Memory Savings: %.2fx (%.0f MiB)", tilesTotalMibs / tilesHeapAllocatedMib, tilesTotalMibs - tilesHeapAllocatedMib);
             ImGui::PopStyleColor();
         }
         else

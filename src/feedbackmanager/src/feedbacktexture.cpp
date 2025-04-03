@@ -56,9 +56,6 @@ namespace nvfeedback
         }
 
         tiledTextureManager->AddTiledTexture(tiledTextureDesc, m_tiledTextureId);
-
-        if (!m_tiledTextureId)
-            return;
         
         rtxts::TextureDesc feedbackDesc = tiledTextureManager->GetTextureDesc(m_tiledTextureId, rtxts::eFeedbackTexture);
         if (device->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D12)
@@ -125,4 +122,84 @@ namespace nvfeedback
     {
         return m_minMipTexture;
     }
+
+    bool FeedbackTextureImpl::IsTilePacked(uint32_t tileIndex)
+    {
+        return tileIndex >= GetPackedMipInfo().startTileIndexInOverallResource;
+    }
+
+    void FeedbackTextureImpl::GetTileInfo(uint32_t tileIndex, std::vector<FeedbackTextureTileInfo>& tiles)
+    {
+        tiles.clear();
+
+        auto& tileShape = GetTileShape();
+        auto& packedMipInfo = GetPackedMipInfo();
+        const nvrhi::TextureDesc textureDesc = GetReservedTexture()->getDesc();
+        bool isBlockCompressed = (textureDesc.format >= nvrhi::Format::BC1_UNORM && textureDesc.format <= nvrhi::Format::BC7_UNORM_SRGB);
+
+        uint32_t firstPackedTileIndex = packedMipInfo.startTileIndexInOverallResource;
+
+        if (IsTilePacked(tileIndex))
+        {
+            for (uint32_t mip = packedMipInfo.numStandardMips; mip < uint32_t(packedMipInfo.numStandardMips + packedMipInfo.numPackedMips); mip++)
+            {
+                uint32_t width = std::max(textureDesc.width >> mip, 1u);
+                uint32_t height = std::max(textureDesc.height >> mip, 1u);
+
+                // Round up subresource size for BC compressed formats to match block sizes
+                if (isBlockCompressed)
+                {
+                    // Round up to 4x4 blocks
+                    width = ((width + 3) / 4) * 4;
+                    height = ((height + 3) / 4) * 4;
+                }
+
+                FeedbackTextureTileInfo tile;
+                tile.xInTexels = 0;
+                tile.yInTexels = 0;
+                tile.mip = mip;
+                tile.widthInTexels = width;
+                tile.heightInTexels = height;
+                tiles.push_back(tile);
+            }
+        }
+        else
+        {
+            const auto& tileCoord = m_pFeedbackManager->GetTiledTextureManager()->GetTileCoordinates(m_tiledTextureId);
+            uint32_t tileX = tileCoord[tileIndex].x;
+            uint32_t tileY = tileCoord[tileIndex].y;
+            uint32_t mip = tileCoord[tileIndex].mipLevel;
+            uint32_t width = tileShape.widthInTexels;
+            uint32_t height = tileShape.heightInTexels;
+
+            uint32_t subresourceWidth = std::max(textureDesc.width >> mip, 1u);
+            uint32_t subresourceHeight = std::max(textureDesc.height >> mip, 1u);
+
+            // Round up subresource size for BC compressed formats to match block sizes
+            if (isBlockCompressed)
+            {
+                // Round up to 4x4 blocks
+                subresourceWidth = ((subresourceWidth + 3) / 4) * 4;
+                subresourceHeight = ((subresourceHeight + 3) / 4) * 4;
+            }
+
+            uint32_t x = tileX * width;
+            uint32_t y = tileY * height;
+
+            // Make sure the tile (for filling out the data) doesn't extend past the actual subresource
+            if (x + width > subresourceWidth)
+                width = subresourceWidth - x;
+            if (y + height > subresourceHeight)
+                height = subresourceHeight - y;
+
+            FeedbackTextureTileInfo tile;
+            tile.xInTexels = x;
+            tile.yInTexels = y;
+            tile.mip = mip;
+            tile.widthInTexels = width;
+            tile.heightInTexels = height;
+            tiles.push_back(tile);
+        }
+    }
+    
 }

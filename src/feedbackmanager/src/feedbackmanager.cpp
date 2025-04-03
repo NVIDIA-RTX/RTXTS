@@ -12,6 +12,7 @@
 #include "feedbackmanager_internal.h"
 
 #include <map>
+#include <assert.h>
 
 namespace nvfeedback
 {
@@ -35,7 +36,7 @@ namespace nvfeedback
             m_defragBuffer = m_device->createBuffer(bufferDesc);
         }
 
-        m_heapAllocator = std::make_shared<HeapAllocatorImpl>(m_device);
+        m_heapAllocator = std::make_shared<HeapAllocatorImpl>(m_device, desc.numFramesInFlight);
 
         rtxts::TiledTextureManagerDesc tiledTextureManagerDesc = {};
         tiledTextureManagerDesc.pHeapAllocator = m_heapAllocator.get();
@@ -94,6 +95,10 @@ namespace nvfeedback
         m_statsTilesRequested = 0;
         m_statsTilesIdle = 0;
 
+        rtxts::TiledTextureManagerConfig tiledTextureManagerConfig = {};
+        tiledTextureManagerConfig.maxStandbyTiles = config.maxStandbyTiles;
+        m_tiledTextureManager->SetConfig(tiledTextureManagerConfig);
+
         auto& readbackTextures = m_texturesToReadback[m_frameIndex];
         if (!readbackTextures.empty())
         {
@@ -107,45 +112,12 @@ namespace nvfeedback
                 samplerFeedbackDesc.pMinMipData = (uint8_t*)(pReadbackData);
                 m_tiledTextureManager->UpdateWithSamplerFeedback(readbackTextures[i]->GetTiledTextureId(), samplerFeedbackDesc, timeStamp, m_updateConfigThisFrame.tileTimeoutSeconds);
 
-                std::vector<rtxts::TileType> tilesToUnmap;
-                m_tiledTextureManager->GetTilesToUnmap(readbackTextures[i]->GetTiledTextureId(), tilesToUnmap);
-                if (!tilesToUnmap.empty())
-                {
-                    const auto& tilesCoordinates = m_tiledTextureManager->GetTileCoordinates(readbackTextures[i]->GetTiledTextureId());
-                    uint32_t tileToUnmapNum = (uint32_t)tilesToUnmap.size();
-
-                    nvrhi::TiledTextureRegion tiledTextureRegion = {};
-                    tiledTextureRegion.tilesNum = 1;
-
-                    nvrhi::TextureTilesMapping textureTilesMapping = {};
-                    textureTilesMapping.numTextureRegions = tileToUnmapNum;
-                    std::vector<nvrhi::TiledTextureCoordinate> tiledTextureCoordinates(textureTilesMapping.numTextureRegions);
-                    std::vector<nvrhi::TiledTextureRegion> tiledTextureRegions(textureTilesMapping.numTextureRegions, tiledTextureRegion);
-                    textureTilesMapping.tiledTextureCoordinates = tiledTextureCoordinates.data();
-                    textureTilesMapping.tiledTextureRegions = tiledTextureRegions.data();
-
-                    uint32_t tilesProcessedNum = 0;
-                    for (auto& tileIndex : tilesToUnmap)
-                    {
-                        // Process only unpacked tiles
-                        nvrhi::TiledTextureCoordinate& tiledTextureCoordinate = tiledTextureCoordinates[tilesProcessedNum];
-                        tiledTextureCoordinate.mipLevel = tilesCoordinates[tileIndex].mipLevel;
-                        tiledTextureCoordinate.arrayLevel = 0;
-                        tiledTextureCoordinate.x = tilesCoordinates[tileIndex].x;
-                        tiledTextureCoordinate.y = tilesCoordinates[tileIndex].y;
-                        tiledTextureCoordinate.z = 0;
-
-                        tilesProcessedNum++;
-                    }
-
-                    m_device->updateTextureTileMappings(readbackTextures[i]->GetReservedTexture(), &textureTilesMapping, 1);
-
-                    m_minMipDirtyTextures.insert(readbackTextures[i]);
-                }
-
                 m_device->unmapBuffer(readbackTextures[i]->GetFeedbackResolveBuffer(m_frameIndex));
             }
         }
+
+        // Update the standby queue
+        m_tiledTextureManager->UpdateStandbyQueue();
 
         // Collect textures to read back
         readbackTextures.clear();
@@ -161,96 +133,60 @@ namespace nvfeedback
             }
         }
 
+        // Get tiles to unmap and map from the tiled texture manager
+        // TODO: The current code does not merge unmapping and mapping tiles for the same textures. It would be more optimal.
+        std::vector<rtxts::TileType> tilesRequestedNew;
+        std::vector<rtxts::TileType> tilesToUnmap;
         for (auto& feedbackTexture : m_textures)
         {
-            std::vector<rtxts::TileType> tilesRequestedNew;
-            m_tiledTextureManager->GetTilesToMap(feedbackTexture->GetTiledTextureId(), tilesRequestedNew);
+            // Unmap tiles
+            m_tiledTextureManager->GetTilesToUnmap(feedbackTexture->GetTiledTextureId(), tilesToUnmap);
+            if (!tilesToUnmap.empty())
+            {
+                const auto& tilesCoordinates = m_tiledTextureManager->GetTileCoordinates(feedbackTexture->GetTiledTextureId());
+                uint32_t tileToUnmapNum = (uint32_t)tilesToUnmap.size();
 
+                nvrhi::TiledTextureRegion tiledTextureRegion = {};
+                tiledTextureRegion.tilesNum = 1;
+
+                nvrhi::TextureTilesMapping textureTilesMapping = {};
+                textureTilesMapping.numTextureRegions = tileToUnmapNum;
+                std::vector<nvrhi::TiledTextureCoordinate> tiledTextureCoordinates(textureTilesMapping.numTextureRegions);
+                std::vector<nvrhi::TiledTextureRegion> tiledTextureRegions(textureTilesMapping.numTextureRegions, tiledTextureRegion);
+                textureTilesMapping.tiledTextureCoordinates = tiledTextureCoordinates.data();
+                textureTilesMapping.tiledTextureRegions = tiledTextureRegions.data();
+
+                uint32_t tilesProcessedNum = 0;
+                for (auto& tileIndex : tilesToUnmap)
+                {
+                    // Process only unpacked tiles
+                    nvrhi::TiledTextureCoordinate& tiledTextureCoordinate = tiledTextureCoordinates[tilesProcessedNum];
+                    tiledTextureCoordinate.mipLevel = tilesCoordinates[tileIndex].mipLevel;
+                    tiledTextureCoordinate.arrayLevel = 0;
+                    tiledTextureCoordinate.x = tilesCoordinates[tileIndex].x;
+                    tiledTextureCoordinate.y = tilesCoordinates[tileIndex].y;
+                    tiledTextureCoordinate.z = 0;
+
+                    tilesProcessedNum++;
+                }
+
+                m_device->updateTextureTileMappings(feedbackTexture->GetReservedTexture(), &textureTilesMapping, 1);
+
+                m_minMipDirtyTextures.insert(feedbackTexture);
+            }
+
+            // Collect new tiles to stream in
+            m_tiledTextureManager->GetTilesToMap(feedbackTexture->GetTiledTextureId(), tilesRequestedNew);
             if (!tilesRequestedNew.empty())
             {
-                const nvrhi::TextureDesc textureDesc = feedbackTexture->GetReservedTexture()->getDesc();
-                bool isBlockCompressed = (textureDesc.format >= nvrhi::Format::BC1_UNORM && textureDesc.format <= nvrhi::Format::BC7_UNORM_SRGB);
-
-                auto& tileShape = feedbackTexture->GetTileShape();
-                auto& packedMipInfo = feedbackTexture->GetPackedMipInfo();
-
-                uint32_t firstPackedTileIndex = packedMipInfo.startTileIndexInOverallResource;
-                bool seenPackedTiles = false;
                 FeedbackTextureUpdate update;
                 update.texture = feedbackTexture;
                 for (auto& tileIndex : tilesRequestedNew)
                 {
-                    if (!seenPackedTiles && tileIndex >= firstPackedTileIndex)
-                    {
-                        uint32_t currentTileIndex = firstPackedTileIndex;
-                        uint32_t processedTilesNum = 0;
-                        for (uint32_t mip = packedMipInfo.numStandardMips; mip < uint32_t(packedMipInfo.numStandardMips + packedMipInfo.numPackedMips); mip++)
-                        {
-                            uint32_t width = std::max(textureDesc.width >> mip, 1u);
-                            uint32_t height = std::max(textureDesc.height >> mip, 1u);
-
-                            // Round up subresource size for BC compressed formats to match block sizes
-                            if (isBlockCompressed)
-                            {
-                                // Round up to 4x4 blocks
-                                width = ((width + 3) / 4) * 4;
-                                height = ((height + 3) / 4) * 4;
-                            }
-
-                            FeedbackTextureTile tile;
-                            tile.x = 0;
-                            tile.y = 0;
-                            tile.mip = mip;
-                            tile.width = width;
-                            tile.height = height;
-                            tile.isPacked = true;
-                            update.tiles.push_back(tile);
-                            update.tileIndices.push_back(currentTileIndex); // Sequentially assign tile indices from packed mip levels(the exact mapping is undefined)
-
-                            if (++processedTilesNum < packedMipInfo.numTilesForPackedMips)
-                                currentTileIndex++;
-                        }
-                        seenPackedTiles = true;
-                    }
-                    else if (tileIndex < firstPackedTileIndex)
-                    {
-                        const auto& tileCoord = m_tiledTextureManager->GetTileCoordinates(feedbackTexture->GetTiledTextureId());
-                        uint32_t tileX = tileCoord[tileIndex].x;
-                        uint32_t tileY = tileCoord[tileIndex].y;
-                        uint32_t mip = tileCoord[tileIndex].mipLevel;
-                        uint32_t width = tileShape.widthInTexels;
-                        uint32_t height = tileShape.heightInTexels;
-
-                        uint32_t subresourceWidth = std::max(textureDesc.width >> mip, 1u);
-                        uint32_t subresourceHeight = std::max(textureDesc.height >> mip, 1u);
-
-                        // Round up subresource size for BC compressed formats to match block sizes
-                        if (isBlockCompressed)
-                        {
-                            // Round up to 4x4 blocks
-                            subresourceWidth = ((subresourceWidth + 3) / 4) * 4;
-                            subresourceHeight = ((subresourceHeight + 3) / 4) * 4;
-                        }
-
-                        uint32_t x = tileX * width;
-                        uint32_t y = tileY * height;
-
-                        // Make sure the tile (for filling out the data) doesn't extend past the actual subresource
-                        if (x + width > subresourceWidth)
-                            width = subresourceWidth - x;
-                        if (y + height > subresourceHeight)
-                            height = subresourceHeight - y;
-
-                        FeedbackTextureTile tile;
-                        tile.x = x;
-                        tile.y = y;
-                        tile.mip = mip;
-                        tile.width = width;
-                        tile.height = height;
-                        tile.isPacked = false;
-                        update.tiles.push_back(tile);
-                        update.tileIndices.push_back(tileIndex);
-                    }
+#if _DEBUG
+                    assert(std::find(update.tileIndices.begin(), update.tileIndices.end(), tileIndex) == update.tileIndices.end());
+#endif
+                    update.tileIndices.push_back(tileIndex);
                 }
                 results->textures.push_back(update);
             }
@@ -261,11 +197,11 @@ namespace nvfeedback
         if (m_updateConfigThisFrame.defragmentHeaps)
         {
             rtxts::TileAllocation prevTileAllocation;
-            rtxts::TileAllocationInHeap tileAllocation = m_tiledTextureManager->GetFragmentedTextureTile(prevTileAllocation);
+            rtxts::TextureAndTile tileAllocation = m_tiledTextureManager->GetFragmentedTextureTile(prevTileAllocation);
             if (tileAllocation.textureId)
             {
                 m_pDefragTexture = m_feedbackTexturesMapping[tileAllocation.textureId];
-                m_defragTile = tileAllocation.textureTileIndex;
+                m_defragTile = tileAllocation.tileIndex;
             }
 
             if (m_pDefragTexture)
@@ -462,10 +398,7 @@ namespace nvfeedback
 
     void FeedbackManagerImpl::EndFrame()
     {
-        if (m_updateConfigThisFrame.releaseEmptyHeaps)
-        {
-            m_heapAllocator->ReleaseEmptyHeaps();
-        }
+        m_heapAllocator->ReleaseEmptyHeaps(m_updateConfigThisFrame.releaseEmptyHeaps, m_frameIndex);
 
         // Cycle textures which were updated in this frame to the back of the ringbuffer
         if (m_texturesRingbuffer.size() > 0 && m_updateConfigThisFrame.maxTexturesToUpdate > 0)
@@ -497,6 +430,7 @@ namespace nvfeedback
             rtxts::Statistics statistics = m_tiledTextureManager->GetStatistics();
             m_statsLastFrame.tilesAllocated = statistics.allocatedTilesNum;
             m_statsLastFrame.tilesTotal = statistics.totalTilesNum;
+            m_statsLastFrame.tilesStandby = statistics.standbyTilesNum;
         }
     }
 
@@ -511,8 +445,9 @@ namespace nvfeedback
         return new FeedbackManagerImpl(device, desc);
     }
 
-    HeapAllocatorImpl::HeapAllocatorImpl(nvrhi::IDevice* device)
+    HeapAllocatorImpl::HeapAllocatorImpl(nvrhi::IDevice* device, uint32_t framesInFlight)
         : m_device(device)
+        , m_framesInFlight(framesInFlight)
         , m_totalAllocatedBytes(0)
     {
     }
@@ -560,16 +495,26 @@ namespace nvfeedback
         }
     }
 
-    void HeapAllocatorImpl::ReleaseEmptyHeaps()
+    void HeapAllocatorImpl::ReleaseEmptyHeaps(bool releaseEmptyHeaps, uint32_t frameIndex)
     {
-        for (auto heapIndex : m_freeHeapIndices)
-        {
-            if (m_heaps[heapIndex])
-            {
-                m_totalAllocatedBytes -= m_buffers[heapIndex]->getDesc().byteSize;
+        uint32_t framesBucket = frameIndex % m_framesInFlight;
+        m_buffersToRelease[framesBucket].clear();
+        m_heapsToRelease[framesBucket].clear();
 
-                m_heaps[heapIndex] = nullptr;
-                m_buffers[heapIndex] = nullptr;
+        if (releaseEmptyHeaps)
+        {
+            for (auto heapIndex : m_freeHeapIndices)
+            {
+                if (m_heaps[heapIndex])
+                {
+                    m_totalAllocatedBytes -= m_buffers[heapIndex]->getDesc().byteSize;
+
+                    m_buffersToRelease[framesBucket].push_back(m_buffers[heapIndex]);
+                    m_heapsToRelease[framesBucket].push_back(m_heaps[heapIndex]);
+
+                    m_heaps[heapIndex] = nullptr;
+                    m_buffers[heapIndex] = nullptr;
+                }
             }
         }
     }

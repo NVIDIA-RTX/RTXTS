@@ -1,5 +1,5 @@
 [submodule "donut"]
-	path = donut
+	path = external/donut
 	url = https://github.com/NVIDIA-RTX/Donut
 	branch = main
 [submodule "rtxts-ttm"]

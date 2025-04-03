@@ -1,4 +1,4 @@
-# RTX Texture Streaming SDK v0.5.0 BETA
+# RTX Texture Streaming SDK v0.6.0 BETA
 
 ![banner](docs/images/banner.png)
 
@@ -51,7 +51,6 @@ The "Memory Savings" stat in the sample represents the amount of memory saved by
 - Currently, only block compressed textures are supported for tiled resources. This is a limitation in the sample code, not of any of the used APIs.
 - The G-Buffer rendering pixel shader is annotated with `[earlydepthstencil]`. This is currently required to preserve Early-Z acceleration in the presence of `WriteSamplerFeedback` usage.
 - The sample is mainly intended to demonstrate RTX Texture Streaming and might not load or render all GLTF scenes correctly.
-- Cascade Shadow Maps in the sample have a quality issue which does not affect texture streaming.
 
 ## Support
 

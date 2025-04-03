@@ -61,7 +61,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_RUNTIME_OUTPUT_DIRECT
 set(DONUT_SHADERS_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders/framework")
 set(folder "RTXTS Sample")
 
-add_subdirectory(donut)
+add_subdirectory(external/donut)
 add_subdirectory(libraries/rtxts-ttm)
 
 set_target_properties(rtxts-ttm PROPERTIES FOLDER "RTXTS-TTM")
@@ -102,7 +102,7 @@ endif()
 
 # Shaders
 
-include(donut/compileshaders.cmake)
+include(external/donut/compileshaders.cmake)
 
 file(GLOB shaders
 	"shaders/*.hlsl"

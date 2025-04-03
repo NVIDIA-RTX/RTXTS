@@ -17,6 +17,24 @@
 
 namespace nvfeedback
 {
+    struct FeedbackTextureTileInfo
+    {
+        uint32_t mip;
+        uint32_t xInTexels;
+        uint32_t yInTexels;
+        uint32_t widthInTexels;
+        uint32_t heightInTexels;
+
+        bool operator==(const FeedbackTextureTileInfo& b) const
+        {
+            return mip == b.mip &&
+                xInTexels == b.xInTexels &&
+                yInTexels == b.yInTexels &&
+                widthInTexels == b.widthInTexels &&
+                heightInTexels == b.heightInTexels;
+        }
+    };
+
     class FeedbackTexture
     {
     public:
@@ -26,15 +44,18 @@ namespace nvfeedback
         virtual nvrhi::TextureHandle GetReservedTexture() = 0;
         virtual nvrhi::SamplerFeedbackTextureHandle GetSamplerFeedbackTexture() = 0;
         virtual nvrhi::TextureHandle GetMinMipTexture() = 0;
+        virtual bool IsTilePacked(uint32_t tileIndex) = 0;
+        virtual void GetTileInfo(uint32_t tileIndex, std::vector<FeedbackTextureTileInfo>& tiles) = 0;
     };
 
     struct FeedbackManagerStats
     {
         uint64_t heapAllocationInBytes; // The amount of heap space allocated in bytes
-        uint32_t tilesTotal; // Total number of tiles tracked in all textures
-        uint32_t tilesRequested; // Number of tiles actively being requested for rendering
-        uint32_t tilesAllocated; // Number of tiles allocated in heaps
-        uint32_t tilesIdle; // Number of tiles no longer being requested but not freed
+        uint32_t tilesTotal;            // Total number of tiles tracked in all textures
+        uint32_t tilesRequested;        // Number of tiles actively being requested for rendering
+        uint32_t tilesAllocated;        // Number of tiles allocated in heaps
+        uint32_t tilesIdle;             // Number of tiles no longer being requested but not freed
+        uint32_t tilesStandby;          // Number of tiles in the standby queue
 
         double cputimeBeginFrame;
         double cputimeUpdateTileMappings;
@@ -53,31 +74,12 @@ namespace nvfeedback
         float tileTimeoutSeconds; // Timeout of tile allocation in seconds
         bool defragmentHeaps; // Enable defragmentation of heaps
         bool releaseEmptyHeaps; // Enable releasing of empty heaps
-    };
-
-    struct FeedbackTextureTile
-    {
-        uint32_t mip;
-        uint32_t x;
-        uint32_t y;
-        uint32_t width;
-        uint32_t height;
-        bool isPacked;
-
-        bool operator==(const FeedbackTextureTile& b) const
-        {
-            return mip == b.mip &&
-                x == b.x &&
-                y == b.y &&
-                width == b.width &&
-                height == b.height;
-        }
+        uint32_t maxStandbyTiles; // Maximum number of tiles in the standby queue
     };
 
     struct FeedbackTextureUpdate
     {
         FeedbackTexture* texture;
-        std::vector<FeedbackTextureTile> tiles;
         std::vector<uint32_t> tileIndices;
     };
 

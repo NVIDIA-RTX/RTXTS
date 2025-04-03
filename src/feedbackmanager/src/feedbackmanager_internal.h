@@ -15,6 +15,7 @@
 #include <memory>
 #include <chrono>
 #include <set>
+#include <map>
 #include <assert.h>
 #include <functional>
 #include <algorithm>
@@ -75,7 +76,7 @@ namespace nvfeedback
     class HeapAllocatorImpl : public rtxts::HeapAllocator
     {
     public:
-        HeapAllocatorImpl(nvrhi::IDevice* device);
+        HeapAllocatorImpl(nvrhi::IDevice* device, uint32_t framesInFlight);
         ~HeapAllocatorImpl() {};
 
         void AllocateHeap(uint64_t heapSizeInBytes, uint32_t& heapId);
@@ -84,14 +85,18 @@ namespace nvfeedback
         nvrhi::BufferHandle GetBufferHandle(uint32_t heapId) { return heapId ? m_buffers[heapId - 1] : nullptr; }
 
         uint64_t GetTotalAllocatedBytes() { return m_totalAllocatedBytes; }
-        void ReleaseEmptyHeaps();
+        void ReleaseEmptyHeaps(bool releaseEmptyHeaps, uint32_t frameIndex);
 
     private:
+        uint32_t m_framesInFlight;
         nvrhi::DeviceHandle m_device;
         std::vector<uint32_t> m_freeHeapIndices;
         std::vector<nvrhi::HeapHandle> m_heaps;
         std::vector<nvrhi::BufferHandle> m_buffers;
         uint64_t m_totalAllocatedBytes;
+
+        std::map<uint32_t, std::vector<nvrhi::HeapHandle>> m_heapsToRelease;
+        std::map<uint32_t, std::vector<nvrhi::BufferHandle>> m_buffersToRelease;
     };
 
     class FeedbackManagerImpl : public FeedbackManager
@@ -115,6 +120,8 @@ namespace nvfeedback
         void AddStat_UpdateTileMappingCall(uint32_t count) { m_numUpdateTileMappingsCalls += count; }
         void AddStat_UpdateTileMappingTime(double time) { m_cputimeDxUpdateTileMappings += time; }
 
+        rtxts::TiledTextureManager* GetTiledTextureManager() { return m_tiledTextureManager.get(); }
+
     private:
         FeedbackManagerDesc m_desc;
         FeedbackUpdateConfig m_updateConfigThisFrame;
@@ -130,7 +137,7 @@ namespace nvfeedback
 
         nvrhi::BufferHandle m_defragBuffer; // Defragmentation tile save/restore buffer
         FeedbackTextureImpl *m_pDefragTexture; // Which texture we are defragmenting
-        uint32_t m_defragTile; // Which tile in the texture is being defragmented
+        rtxts::TileType m_defragTile; // Which tile in the texture is being defragmented
 
         uint32_t m_statsTilesRequested;
         uint32_t m_statsTilesIdle;
