@@ -1,11 +1,13 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
  */
 
 #include "MaterialBindingCacheFeedback.h"
@@ -16,6 +18,7 @@ MaterialBindingCacheFeedback::MaterialBindingCacheFeedback(
     FeedbackTextureMaps* feedbackMaps,
     nvrhi::ShaderType shaderType, 
     uint32_t registerSpace,
+    bool registerSpaceIsDescriptorSet,
     const std::vector<MaterialResourceBindingFeedback>& bindings,
     nvrhi::ISampler* sampler,
     nvrhi::ISampler* samplerMinMip,
@@ -31,6 +34,7 @@ MaterialBindingCacheFeedback::MaterialBindingCacheFeedback(
     nvrhi::BindingLayoutDesc layoutDesc;
     layoutDesc.visibility = shaderType;
     layoutDesc.registerSpace = registerSpace;
+    layoutDesc.registerSpaceIsDescriptorSet = registerSpaceIsDescriptorSet;
 
     {
         nvrhi::TextureDesc textureDesc = {};
@@ -53,10 +57,12 @@ MaterialBindingCacheFeedback::MaterialBindingCacheFeedback(
     {
         nvrhi::BindingLayoutItem layoutItem{};
         layoutItem.slot = item.slot;
-        
+        layoutItem.size = 1;
+
         switch (item.resource)
         {
         case MaterialResourceFeedback::ConstantBuffer:
+        case MaterialResourceFeedback::ConstantBufferFeedback:
             layoutItem.type = nvrhi::ResourceType::ConstantBuffer;
             break;
         case MaterialResourceFeedback::DiffuseTexture:
@@ -101,7 +107,7 @@ nvrhi::IBindingLayout* MaterialBindingCacheFeedback::GetLayout() const
     return m_BindingLayout;
 }
 
-nvrhi::IBindingSet* MaterialBindingCacheFeedback::GetMaterialBindingSet(const donut::engine::Material* material)
+nvrhi::IBindingSet* MaterialBindingCacheFeedback::GetMaterialBindingSet(const donut::engine::Material* material, nvrhi::BufferHandle materialConstantsFeedback)
 {
     std::lock_guard<std::mutex> lockGuard(m_Mutex);
 
@@ -110,7 +116,7 @@ nvrhi::IBindingSet* MaterialBindingCacheFeedback::GetMaterialBindingSet(const do
     if (bindingSet)
         return bindingSet;
 
-    bindingSet = CreateMaterialBindingSet(material);
+    bindingSet = CreateMaterialBindingSet(material, materialConstantsFeedback);
 
     return bindingSet;
 }
@@ -149,7 +155,7 @@ nvrhi::BindingSetItem MaterialBindingCacheFeedback::GetTextureMinMipBindingSetIt
     return nvrhi::BindingSetItem::Texture_SRV(slot, m_feedbackMaps->m_feedbackTexturesBySource[texture.get()]->m_feedbackTexture->GetMinMipTexture());
 }
 
-nvrhi::BindingSetHandle MaterialBindingCacheFeedback::CreateMaterialBindingSet(const donut::engine::Material* material)
+nvrhi::BindingSetHandle MaterialBindingCacheFeedback::CreateMaterialBindingSet(const donut::engine::Material* material, nvrhi::BufferHandle materialConstantsFeedback)
 {
     nvrhi::BindingSetDesc bindingSetDesc;
     bindingSetDesc.trackLiveness = m_TrackLiveness;
@@ -164,6 +170,12 @@ nvrhi::BindingSetHandle MaterialBindingCacheFeedback::CreateMaterialBindingSet(c
             setItem = nvrhi::BindingSetItem::ConstantBuffer(
                 item.slot, 
                 material->materialConstants);
+            break;
+
+        case MaterialResourceFeedback::ConstantBufferFeedback:
+            setItem = nvrhi::BindingSetItem::ConstantBuffer(
+                item.slot, 
+                materialConstantsFeedback);
             break;
 
         case MaterialResourceFeedback::Sampler:

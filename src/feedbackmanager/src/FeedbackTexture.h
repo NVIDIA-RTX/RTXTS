@@ -1,27 +1,31 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
  */
 
 #pragma once
 
 #include <nvrhi/nvrhi.h>
 
-#include "../include/feedbackmanager.h"
-#include "rtxts-ttm/tiledTextureManager.h"
+#include "../include/FeedbackManager.h"
+#include "rtxts-ttm/TiledTextureManager.h"
 
 #include <vector>
 #include <atomic>
+#include <unordered_map>
 
 namespace nvfeedback
 {
     class FeedbackManagerImpl;
     class FeedbackTextureImpl;
+    class FeedbackTextureSetImpl;
 
     struct TextureAndTile
     {
@@ -38,7 +42,6 @@ namespace nvfeedback
     class FeedbackTextureImpl : public FeedbackTexture
     {
     public:
-
         unsigned long AddRef() override
         {
             return ++m_refCount;
@@ -58,6 +61,8 @@ namespace nvfeedback
         nvrhi::TextureHandle GetMinMipTexture() override;
         bool IsTilePacked(uint32_t tileIndex) override;
         void GetTileInfo(uint32_t tileIndex, std::vector<FeedbackTextureTileInfo>& tiles) override;
+        uint32_t GetNumTextureSets() const override;
+        FeedbackTextureSet* GetTextureSet(uint32_t index) const override;
 
         // Internal methods
         FeedbackTextureImpl(const nvrhi::TextureDesc& desc, FeedbackManagerImpl* pFeedbackManager, rtxts::TiledTextureManager* tiledTextureManager, nvrhi::IDevice* device, uint32_t numReadbacks);
@@ -70,6 +75,18 @@ namespace nvfeedback
         const nvrhi::PackedMipDesc& GetPackedMipInfo() const { return m_packedMipDesc; }
 
         uint32_t GetTiledTextureId() { return m_tiledTextureId; }
+        
+        // Methods for texture set management
+        bool AddToTextureSet(FeedbackTextureSetImpl* textureSet);
+        bool RemoveFromTextureSet(FeedbackTextureSetImpl* textureSet);
+        void UpdateTextureSets();
+        
+        // Check if this texture is a primary texture in any of its texture sets
+        bool IsPrimaryTexture() const;
+        
+        // Get all texture sets this texture belongs to in vectors, for internal use only
+        const std::vector<FeedbackTextureSetImpl*>& GetTextureSets() const { return m_textureSets; }
+        const std::vector<FeedbackTextureSetImpl*>& GetPrimaryTextureSets() const { return m_primaryTextureSets; }
 
     private:
 
@@ -87,5 +104,9 @@ namespace nvfeedback
         nvrhi::TileShape m_tileShape;
 
         uint32_t m_tiledTextureId = 0;
+        
+        // Members for texture set management
+        std::vector<FeedbackTextureSetImpl*> m_textureSets;
+        std::vector<FeedbackTextureSetImpl*> m_primaryTextureSets;
     };
 }

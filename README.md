@@ -1,4 +1,4 @@
-# RTX Texture Streaming SDK v0.6.0 BETA
+# RTX Texture Streaming SDK v0.7.0 BETA
 
 ![banner](docs/images/banner.png)
 
@@ -45,6 +45,8 @@ Run the `rtxts-sample` project. The sample will look for scenes in the `media` s
 Once the application is running, most of the SDK settings can be accessed via the UI window on the left hand side. The camera can be moved using W/S/A/D keys and rotated by dragging with the left mouse cursor. Press shift while moving to increase speed. Right click on a material in the scene to bring up a visualization of the albedo texture mip chain and its currently allocated state.
 
 The "Memory Savings" stat in the sample represents the amount of memory saved by allocating only the requested tiles, versus all tiles in all loaded textures.
+
+The "Texture Sets" checkbox, enabled by default, enables the grouping of textures belonging to the same material, which implies they are using the same texture coordinates in the pixel shader. These textures will share a Sampler Feedback resource, which reduces the number of `WriteSamplerFeedback` invocations in the shader and the number of Sampler Feedback resources to resolve and read back.
 
 ## Notes and known issues
 

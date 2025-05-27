@@ -13,7 +13,3 @@ build-windows:
     - cd build
     - cmake .. -DCMAKE_BUILD_TYPE=Release
     - cmake --build .
-  # artifacts:
-  #   name: "memo-windows-${CI_COMMIT_SHORT_SHA}"
-  #   paths:
-  #     - bin

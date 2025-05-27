@@ -10,18 +10,13 @@
  * its affiliates is strictly prohibited.
  */
 
-#include <donut/shaders/scene_material.hlsli>
-#include <donut/shaders/forward_vertex.hlsli>
-#include <donut/shaders/material_bindings.hlsli>
+#pragma once
 
-void main(
-    in float4 i_position : SV_Position,
-    in SceneVertex i_vtx,
-    in uint i_instance : INSTANCE,
-    out uint4 o_output : SV_Target0
-)
+#define GBUFFER_SPACE_FEEDBACK 4
+#define GBUFFER_BINDING_FEEDBACK_CONSTANTS 4
+
+struct FeedbackConstants
 {
-    o_output.x = uint(g_Material.materialID);
-    o_output.y = i_instance;
-    o_output.zw = 0;
-}
+    bool useTextureSet;
+};
+

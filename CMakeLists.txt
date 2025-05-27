@@ -67,7 +67,7 @@ add_subdirectory(libraries/rtxts-ttm)
 set_target_properties(rtxts-ttm PROPERTIES FOLDER "RTXTS-TTM")
 
 # Fetch latest version of the assets
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/media)
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/media AND NOT DEFINED ENV{CI_SERVER})
 	# Fetch Assets (in the future we can swap to FetchContent(URL ARCHIVE) to obtain stand-alone asset dirs)
 	include(FetchContent)
 	FetchContent_Populate(
@@ -87,8 +87,6 @@ file(GLOB sources
 	src/feedbackmanager/include/*.h
 	src/feedbackmanager/src/*.h
 	src/feedbackmanager/src/*.cpp
-	streamedTextureManager/*.h
-	streamedTextureManager/*.cpp
 )
 
 add_executable(${project} WIN32 ${sources})

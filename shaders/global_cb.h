@@ -1,26 +1,38 @@
 /*
-* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-*
-* Permission is hereby granted, free of charge, to any person obtaining a
-* copy of this software and associated documentation files (the "Software"),
-* to deal in the Software without restriction, including without limitation
-* the rights to use, copy, modify, merge, publish, distribute, sublicense,
-* and/or sell copies of the Software, and to permit persons to whom the
-* Software is furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
-* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-* DEALINGS IN THE SOFTWARE.
-*/
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
 
 #pragma once
+
+#define GBUFFER_BINDING_GLOBAL_CONSTANTS 3
+
+#define GBUFFER_BINDING_FEEDBACK_CONSTANTS 4
+
+#define GBUFFER_BINDING_MATERIAL_DIFFUSE_FEEDBACKTEXTURE 0
+#define GBUFFER_BINDING_MATERIAL_SPECULAR_FEEDBACKTEXTURE 1
+#define GBUFFER_BINDING_MATERIAL_NORMAL_FEEDBACKTEXTURE 2
+#define GBUFFER_BINDING_MATERIAL_EMISSIVE_FEEDBACKTEXTURE 3
+#define GBUFFER_BINDING_MATERIAL_OCCLUSION_FEEDBACKTEXTURE 4
+#define GBUFFER_BINDING_MATERIAL_TRANSMISSION_FEEDBACKTEXTURE 5
+#define GBUFFER_BINDING_MATERIAL_OPACITY_FEEDBACKTEXTURE 6
+
+#define GBUFFER_BINDING_MATERIAL_DIFFUSE_MINMIPTEXTURE 6
+#define GBUFFER_BINDING_MATERIAL_SPECULAR_MINMIPTEXTURE 7
+#define GBUFFER_BINDING_MATERIAL_NORMAL_MINMIPTEXTURE 8
+#define GBUFFER_BINDING_MATERIAL_EMISSIVE_MINMIPTEXTURE 9
+#define GBUFFER_BINDING_MATERIAL_OCCLUSION_MINMIPTEXTURE 10
+#define GBUFFER_BINDING_MATERIAL_TRANSMISSION_MINMIPTEXTURE 11
+#define GBUFFER_BINDING_MATERIAL_OPACITY_MINMIPTEXTURE 12
+
+#define GBUFFER_BINDING_MATERIAL_SAMPLER_MINMIP 1
 
 struct GlobalConstants
 {

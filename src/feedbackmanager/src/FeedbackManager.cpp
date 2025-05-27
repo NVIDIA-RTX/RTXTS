@@ -1,15 +1,17 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
  */
 
-#include "../include/feedbackmanager.h"
-#include "feedbackmanager_internal.h"
+#include "../include/FeedbackManager.h"
+#include "FeedbackManagerInternal.h"
 
 #include <map>
 #include <assert.h>
@@ -21,25 +23,14 @@ namespace nvfeedback
         m_desc(desc),
         m_numFramesInFlight(desc.numFramesInFlight),
         m_frameIndex(0),
-        m_statsTilesRequested(0),
-        m_statsTilesIdle(0),
         m_statsLastFrame()
     {
         m_texturesToReadback.resize(m_numFramesInFlight);
         ZeroMemory(&m_statsLastFrame, sizeof(FeedbackManagerStats));
 
-        {
-            nvrhi::BufferDesc bufferDesc = {};
-            bufferDesc.byteSize = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
-            bufferDesc.initialState = nvrhi::ResourceStates::CopyDest;
-            bufferDesc.keepInitialState = true;
-            m_defragBuffer = m_device->createBuffer(bufferDesc);
-        }
-
-        m_heapAllocator = std::make_shared<HeapAllocatorImpl>(m_device, desc.numFramesInFlight);
+        m_heapAllocator = std::make_shared<HeapAllocator>(m_device, desc.heapSizeInTiles * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES, desc.numFramesInFlight);
 
         rtxts::TiledTextureManagerDesc tiledTextureManagerDesc = {};
-        tiledTextureManagerDesc.pHeapAllocator = m_heapAllocator.get();
         tiledTextureManagerDesc.heapTilesCapacity = desc.heapSizeInTiles;
         m_tiledTextureManager = std::shared_ptr<rtxts::TiledTextureManager>(CreateTiledTextureManager(tiledTextureManagerDesc));
     }
@@ -54,19 +45,26 @@ namespace nvfeedback
         m_textures.push_back(feedbackTexture);
         m_texturesRingbuffer.push_back(feedbackTexture);
         *ppTex = feedbackTexture;
+        return true;
+    }
 
-        uint32_t tiledTextureId = feedbackTexture->GetTiledTextureId();
-        if (tiledTextureId)
+    bool FeedbackManagerImpl::CreateTextureSet(FeedbackTextureSet** ppTexSet)
+    {
+        if (!ppTexSet)
         {
-            m_feedbackTexturesMapping[tiledTextureId] = feedbackTexture;
+            return false;
         }
-
+        
+        FeedbackTextureSetImpl* textureSet = new FeedbackTextureSetImpl(this, m_device, m_numFramesInFlight);
+        
+        *ppTexSet = textureSet;
         return true;
     }
 
     void FeedbackManagerImpl::UnregisterTexture(FeedbackTextureImpl* feedbackTexture)
     {
         m_textures.erase(std::remove(m_textures.begin(), m_textures.end(), feedbackTexture), m_textures.end());
+        
         m_texturesRingbuffer.erase(std::remove(m_texturesRingbuffer.begin(), m_texturesRingbuffer.end(), feedbackTexture), m_texturesRingbuffer.end());
 
         for (auto& vec : m_texturesToReadback)
@@ -81,22 +79,29 @@ namespace nvfeedback
             m_minMipDirtyTextures.erase(it);
     }
 
+    void FeedbackManagerImpl::UpdateTextureRingBufferState(FeedbackTextureImpl* pTex, bool includeInRingBuffer)
+    {
+        auto it = std::find(m_texturesRingbuffer.begin(), m_texturesRingbuffer.end(), pTex);
+        if (includeInRingBuffer && it == m_texturesRingbuffer.end())
+        {
+            m_texturesRingbuffer.push_back(pTex);
+        }
+        else if (!includeInRingBuffer && it != m_texturesRingbuffer.end())
+        {
+            m_texturesRingbuffer.erase(it);
+        }
+    }
+
     void FeedbackManagerImpl::BeginFrame(nvrhi::ICommandList* commandList, const FeedbackUpdateConfig& config, FeedbackTextureCollection* results)
     {
-        // Instrumentation
-        m_cputimeDxUpdateTileMappings = 0;
-        m_numUpdateTileMappingsCalls = 0;
         m_timerBeginFrame.Begin();
 
         m_frameIndex = config.frameIndex % m_numFramesInFlight;
 
         m_updateConfigThisFrame = config;
 
-        m_statsTilesRequested = 0;
-        m_statsTilesIdle = 0;
-
         rtxts::TiledTextureManagerConfig tiledTextureManagerConfig = {};
-        tiledTextureManagerConfig.maxStandbyTiles = config.maxStandbyTiles;
+        tiledTextureManagerConfig.numExtraStandbyTiles = config.numExtraStandbyTiles;
         m_tiledTextureManager->SetConfig(tiledTextureManagerConfig);
 
         auto& readbackTextures = m_texturesToReadback[m_frameIndex];
@@ -104,20 +109,43 @@ namespace nvfeedback
         {
             float timeStamp = float(GetTickCount64()) / 1000.0f;
             uint32_t texturesNum = uint32_t(readbackTextures.size());
-            for (uint32_t i = 0; i < texturesNum; ++i)
+            for (uint32_t iReadbackTexture = 0; iReadbackTexture < texturesNum; ++iReadbackTexture)
             {
-                uint8_t* pReadbackData = (uint8_t*)m_device->mapBuffer(readbackTextures[i]->GetFeedbackResolveBuffer(m_frameIndex), nvrhi::CpuAccessMode::Read);
+                FeedbackTextureImpl* readbackTexture = readbackTextures[iReadbackTexture];
+                uint8_t* pReadbackData = (uint8_t*)m_device->mapBuffer(readbackTexture->GetFeedbackResolveBuffer(m_frameIndex), nvrhi::CpuAccessMode::Read);
 
                 rtxts::SamplerFeedbackDesc samplerFeedbackDesc = {};
                 samplerFeedbackDesc.pMinMipData = (uint8_t*)(pReadbackData);
-                m_tiledTextureManager->UpdateWithSamplerFeedback(readbackTextures[i]->GetTiledTextureId(), samplerFeedbackDesc, timeStamp, m_updateConfigThisFrame.tileTimeoutSeconds);
+                m_tiledTextureManager->UpdateWithSamplerFeedback(readbackTexture->GetTiledTextureId(), samplerFeedbackDesc, timeStamp, m_updateConfigThisFrame.tileTimeoutSeconds);
 
-                m_device->unmapBuffer(readbackTextures[i]->GetFeedbackResolveBuffer(m_frameIndex));
+                m_device->unmapBuffer(readbackTexture->GetFeedbackResolveBuffer(m_frameIndex));
+
+                // If this is a primary texture, make followers match its state
+                if (readbackTexture->IsPrimaryTexture())
+                {
+                    auto textureSets = readbackTexture->GetPrimaryTextureSets();
+                    for (auto textureSet : textureSets)
+                    {
+                        uint32_t numTextures = textureSet->GetNumTextures();
+                        uint32_t primaryTextureIndex = textureSet->GetPrimaryTextureIndex();
+                        for (uint32_t iTextureSet = 0; iTextureSet < numTextures; ++iTextureSet)
+                        {
+                            if (iTextureSet == primaryTextureIndex)
+                                continue;
+
+                            // Make the follower texture match the primary texture requested tile state
+                            FeedbackTexture* follower = textureSet->GetTexture(iTextureSet);
+                            FeedbackTextureImpl* followerImpl = static_cast<FeedbackTextureImpl*>(follower);
+                            m_tiledTextureManager->MatchPrimaryTexture(
+                                readbackTexture->GetTiledTextureId(),
+                                followerImpl->GetTiledTextureId(),
+                                timeStamp,
+                                m_updateConfigThisFrame.tileTimeoutSeconds);
+                        }
+                    }
+                }
             }
         }
-
-        // Update the standby queue
-        m_tiledTextureManager->UpdateStandbyQueue();
 
         // Collect textures to read back
         readbackTextures.clear();
@@ -133,10 +161,41 @@ namespace nvfeedback
             }
         }
 
+        // Trim standby tiles if requested
+        if (m_updateConfigThisFrame.trimStandbyTiles)
+        {
+            m_tiledTextureManager->TrimStandbyTiles();
+        }
+
+        // Now check how many heaps the tiled texture manager needs
+        uint32_t numRequiredHeaps = m_tiledTextureManager->GetNumDesiredHeaps();
+        if (numRequiredHeaps > m_heapAllocator->GetNumHeaps())
+        {
+            while (m_heapAllocator->GetNumHeaps() < numRequiredHeaps)
+            {
+                uint32_t heapId;
+                m_heapAllocator->AllocateHeap(heapId);
+                m_tiledTextureManager->AddHeap(heapId);
+            }
+        }
+        else if (m_updateConfigThisFrame.releaseEmptyHeaps)
+        {
+            std::vector<uint32_t> emptyHeaps;
+            m_tiledTextureManager->GetEmptyHeaps(emptyHeaps);
+            for (auto& heapId : emptyHeaps)
+            {
+                m_tiledTextureManager->RemoveHeap(heapId);
+                m_heapAllocator->ReleaseHeap(heapId, m_frameIndex);
+            }
+        }
+
+        // Now let the tiled texture manager allocate
+        m_tiledTextureManager->AllocateRequestedTiles();
+
         // Get tiles to unmap and map from the tiled texture manager
         // TODO: The current code does not merge unmapping and mapping tiles for the same textures. It would be more optimal.
-        std::vector<rtxts::TileType> tilesRequestedNew;
-        std::vector<rtxts::TileType> tilesToUnmap;
+        std::vector<uint32_t> tilesRequestedNew;
+        std::vector<uint32_t> tilesToUnmap;
         for (auto& feedbackTexture : m_textures)
         {
             // Unmap tiles
@@ -193,22 +252,11 @@ namespace nvfeedback
         }
 
         // Defragmentation phase
-        m_pDefragTexture = nullptr;
         if (m_updateConfigThisFrame.defragmentHeaps)
         {
-            rtxts::TileAllocation prevTileAllocation;
-            rtxts::TextureAndTile tileAllocation = m_tiledTextureManager->GetFragmentedTextureTile(prevTileAllocation);
-            if (tileAllocation.textureId)
-            {
-                m_pDefragTexture = m_feedbackTexturesMapping[tileAllocation.textureId];
-                m_defragTile = tileAllocation.tileIndex;
-            }
-
-            if (m_pDefragTexture)
-            {
-                // Save the tile into m_defragBuffer
-                commandList->copyBuffer(m_defragBuffer, 0, m_heapAllocator->GetBufferHandle(prevTileAllocation.heapId), prevTileAllocation.heapTileIndex * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES, D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
-            }
+            // Defragment up to 16 tiles per frame
+            const uint32_t numTiles = 16;
+            m_tiledTextureManager->DefragmentTiles(numTiles);
         }
 
         m_timerBeginFrame.End();
@@ -218,32 +266,7 @@ namespace nvfeedback
     {
         m_timerUpdateTileMappings.Begin();
 
-        // Copy tilesReady because we might modify it for defragmentation
-        FeedbackTextureCollection tilesToMap = *tilesReady;
-
-        if (m_pDefragTexture)
-        {
-            // Insert the tile being defragmented into the list of tiles to be mapped
-            auto it = std::find_if(tilesToMap.textures.begin(), tilesToMap.textures.end(),
-                [&](const FeedbackTextureUpdate& u) { return u.texture == m_pDefragTexture; });
-            if (it != tilesToMap.textures.end())
-            {
-                FeedbackTextureUpdate& update = *it;
-                if (std::find(update.tileIndices.begin(), update.tileIndices.end(), m_defragTile) == update.tileIndices.end())
-                {
-                    update.tileIndices.push_back(m_defragTile);
-                }
-            }
-            else
-            {
-                FeedbackTextureUpdate feedbackTextureUpdate;
-                feedbackTextureUpdate.texture = m_pDefragTexture;
-                feedbackTextureUpdate.tileIndices.push_back(m_defragTile);
-                tilesToMap.textures.push_back(feedbackTextureUpdate);
-            }
-        }
-
-        for (auto& texUpdate : tilesToMap.textures)
+        for (auto& texUpdate : tilesReady->textures)
         {
             FeedbackTextureImpl* texture = dynamic_cast<FeedbackTextureImpl*>(texUpdate.texture);
             m_minMipDirtyTextures.insert(texture);
@@ -303,13 +326,6 @@ namespace nvfeedback
             }
         }
 
-        if (m_pDefragTexture)
-        {
-            auto& alloc = m_tiledTextureManager->GetTileAllocations(m_pDefragTexture->GetTiledTextureId())[m_defragTile];
-            // Restore the tile from m_defragBuffer
-            commandList->copyBuffer(m_heapAllocator->GetBufferHandle(alloc.heapId), alloc.heapTileIndex * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES, m_defragBuffer, 0, D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
-        }
-
         if (!m_minMipDirtyTextures.empty())
         {
             const bool useAutomaticBarriers = false;
@@ -358,14 +374,14 @@ namespace nvfeedback
 
     void FeedbackManagerImpl::ResolveFeedback(nvrhi::ICommandList* commandList)
     {
-        m_timerResolve.Begin();
-
         auto& readbackTextures = m_texturesToReadback[m_frameIndex];
         if (readbackTextures.empty())
         {
-            m_timerApiResolve.Clear();
+            m_timerResolve.Clear();
             return;
         }
+
+        m_timerResolve.Begin();
 
         const bool useAutomaticBarriers = false;
         commandList->setEnableAutomaticBarriers(useAutomaticBarriers);
@@ -376,13 +392,11 @@ namespace nvfeedback
                 commandList->setSamplerFeedbackTextureState(feedbackTexture->GetSamplerFeedbackTexture(), nvrhi::ResourceStates::ResolveSource);
         }
 
-        m_timerApiResolve.Begin();
         {
             uint32_t textureNum = uint32_t(readbackTextures.size());
             for (uint32_t i = 0; i < textureNum; ++i)
                 commandList->decodeSamplerFeedbackTexture(readbackTextures[i]->GetFeedbackResolveBuffer(m_frameIndex), readbackTextures[i]->GetSamplerFeedbackTexture(), nvrhi::Format::R8_UINT);
         }
-        m_timerApiResolve.End();
 
         if (!useAutomaticBarriers)
         {
@@ -398,8 +412,6 @@ namespace nvfeedback
 
     void FeedbackManagerImpl::EndFrame()
     {
-        m_heapAllocator->ReleaseEmptyHeaps(m_updateConfigThisFrame.releaseEmptyHeaps, m_frameIndex);
-
         // Cycle textures which were updated in this frame to the back of the ringbuffer
         if (m_texturesRingbuffer.size() > 0 && m_updateConfigThisFrame.maxTexturesToUpdate > 0)
         {
@@ -413,23 +425,17 @@ namespace nvfeedback
         }
 
         // Save stats
-        m_statsLastFrame.tilesRequested = m_statsTilesRequested;
-        m_statsLastFrame.tilesIdle = m_statsTilesIdle;
-
         m_statsLastFrame.heapAllocationInBytes = m_heapAllocator->GetTotalAllocatedBytes();
 
         m_statsLastFrame.cputimeBeginFrame = m_timerBeginFrame.GetTime();
         m_statsLastFrame.cputimeUpdateTileMappings = m_timerUpdateTileMappings.GetTime();
-        m_statsLastFrame.cputimeDxUpdateTileMappings = m_cputimeDxUpdateTileMappings;
         m_statsLastFrame.cputimeResolve = m_timerResolve.GetTime();
-        m_statsLastFrame.cputimeDxResolve = m_timerApiResolve.GetTime();
-
-        m_statsLastFrame.numUpdateTileMappingsCalls = m_numUpdateTileMappingsCalls;
 
         {
             rtxts::Statistics statistics = m_tiledTextureManager->GetStatistics();
             m_statsLastFrame.tilesAllocated = statistics.allocatedTilesNum;
             m_statsLastFrame.tilesTotal = statistics.totalTilesNum;
+            m_statsLastFrame.heapTilesFree = statistics.heapFreeTilesNum;
             m_statsLastFrame.tilesStandby = statistics.standbyTilesNum;
         }
     }
@@ -445,77 +451,63 @@ namespace nvfeedback
         return new FeedbackManagerImpl(device, desc);
     }
 
-    HeapAllocatorImpl::HeapAllocatorImpl(nvrhi::IDevice* device, uint32_t framesInFlight)
+    HeapAllocator::HeapAllocator(nvrhi::IDevice* device, uint64_t heapSizeInBytes, uint32_t framesInFlight)
         : m_device(device)
         , m_framesInFlight(framesInFlight)
+        , m_heapSizeInBytes(heapSizeInBytes)
         , m_totalAllocatedBytes(0)
+        , m_numHeaps(0)
     {
     }
 
-    void HeapAllocatorImpl::AllocateHeap(uint64_t heapSizeInBytes, uint32_t& heapId)
+    void HeapAllocator::AllocateHeap(uint32_t& heapId)
     {
-        if (m_freeHeapIndices.empty())
+        nvrhi::HeapDesc heapDesc = {};
+        heapDesc.capacity = m_heapSizeInBytes;
+        heapDesc.type = nvrhi::HeapType::DeviceLocal;
+
+        // TODO: Calling createHeap should ideally be called asynchronously to offload the critical path
+        nvrhi::HeapHandle heap = m_device->createHeap(heapDesc);
+
+        nvrhi::BufferDesc bufferDesc = {};
+        bufferDesc.byteSize = m_heapSizeInBytes;
+        bufferDesc.isVirtual = true;
+        bufferDesc.initialState = nvrhi::ResourceStates::CopySource;
+        bufferDesc.keepInitialState = true;
+        nvrhi::BufferHandle buffer = m_device->createBuffer(bufferDesc);
+
+        m_device->bindBufferMemory(buffer, heap, 0);
+
+        if (m_freeHeapIds.empty())
         {
-            m_freeHeapIndices.push_back((uint32_t)m_heaps.size());
-            m_heaps.push_back(nullptr);
-            m_buffers.push_back(nullptr);
+            heapId = (uint32_t)m_heaps.size();
+            m_heaps.push_back(heap);
+            m_buffers.push_back(buffer);
+        }
+        else
+        {
+            heapId = m_freeHeapIds.back();
+            m_freeHeapIds.pop_back();
+            m_heaps[heapId] = heap;
+            m_buffers[heapId] = buffer;
         }
 
-        uint32_t heapIndex = m_freeHeapIndices.back();
-        if (!m_heaps[heapIndex])
-        {
-            nvrhi::HeapDesc heapDesc = {};
-            heapDesc.capacity = heapSizeInBytes;
-            heapDesc.type = nvrhi::HeapType::DeviceLocal;
-            m_heaps[heapIndex] = m_device->createHeap(heapDesc);
-
-            nvrhi::BufferDesc bufferDesc = {};
-            bufferDesc.byteSize = heapSizeInBytes;
-            bufferDesc.isVirtual = true;
-            bufferDesc.initialState = nvrhi::ResourceStates::CopySource;
-            bufferDesc.keepInitialState = true;
-            m_buffers[heapIndex] = m_device->createBuffer(bufferDesc);
-
-            m_totalAllocatedBytes += heapSizeInBytes;
-
-            m_device->bindBufferMemory(m_buffers[heapIndex], m_heaps[heapIndex], 0);
-        }
-
-        m_freeHeapIndices.pop_back();
-
-        heapId = heapIndex + 1;
+        m_totalAllocatedBytes += m_heapSizeInBytes;
+        m_numHeaps++;
     }
 
-    void HeapAllocatorImpl::ReleaseHeap(uint32_t heapId)
+    void HeapAllocator::ReleaseHeap(uint32_t heapId, uint32_t frameIndex)
     {
-        if (heapId && m_heaps[heapId - 1])
-        {
-            uint32_t heapIndex = heapId - 1;
-            m_freeHeapIndices.push_back(heapIndex);
-        }
-    }
+        m_freeHeapIds.push_back(heapId);
 
-    void HeapAllocatorImpl::ReleaseEmptyHeaps(bool releaseEmptyHeaps, uint32_t frameIndex)
-    {
         uint32_t framesBucket = frameIndex % m_framesInFlight;
-        m_buffersToRelease[framesBucket].clear();
-        m_heapsToRelease[framesBucket].clear();
+        m_buffersToRelease[framesBucket].push_back(m_buffers[heapId]);
+        m_heapsToRelease[framesBucket].push_back(m_heaps[heapId]);
 
-        if (releaseEmptyHeaps)
-        {
-            for (auto heapIndex : m_freeHeapIndices)
-            {
-                if (m_heaps[heapIndex])
-                {
-                    m_totalAllocatedBytes -= m_buffers[heapIndex]->getDesc().byteSize;
+        m_heaps[heapId] = nullptr;
+        m_buffers[heapId] = nullptr;
 
-                    m_buffersToRelease[framesBucket].push_back(m_buffers[heapIndex]);
-                    m_heapsToRelease[framesBucket].push_back(m_heaps[heapIndex]);
-
-                    m_heaps[heapIndex] = nullptr;
-                    m_buffers[heapIndex] = nullptr;
-                }
-            }
-        }
+        m_totalAllocatedBytes -= m_heapSizeInBytes;
+        m_numHeaps--;
     }
 }

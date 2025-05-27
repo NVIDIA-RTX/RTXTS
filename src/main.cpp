@@ -1,11 +1,13 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
  *
- * NVIDIA CORPORATION and its licensors retain all intellectual property
- * and proprietary rights in and to this software, related documentation
- * and any modifications thereto.  Any use, reproduction, disclosure or
- * distribution of this software and related documentation without an express
- * license agreement from NVIDIA CORPORATION is strictly prohibited.
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
  */
 
 #include <donut/core/vfs/VFS.h>
@@ -41,6 +43,17 @@
 #include <nvrhi/utils.h>
 #include <nvrhi/common/misc.h>
 
+#ifdef DONUT_WITH_TASKFLOW
+#include <taskflow/taskflow.hpp>
+#endif
+
+using namespace donut;
+using namespace donut::math;
+using namespace donut::app;
+using namespace donut::vfs;
+using namespace donut::engine;
+using namespace donut::render;
+
 // NOTE: This is currently required to talk directly to the d3d12 commandlist for requireTextureState and commitBarriers
 #include "../external/donut/nvrhi/src/d3d12/d3d12-backend.h"
 
@@ -49,7 +62,14 @@
 #include <memory>
 #include <chrono>
 
-#define PROFILE 0
+#include "GBufferFillPassFeedback.h"
+#include "TextureCacheFeedback.h"
+#include "../shaders/feedback_cb.h"
+#include "Profiler.h"
+#include "feedbackmanager/include/feedbackmanager.h"
+#include "rtxts-ttm/tiledTextureManager.h"
+
+using namespace nvfeedback;
 
 extern "C"
 {
@@ -59,59 +79,79 @@ extern "C"
     __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
 }
 
-#ifdef DONUT_WITH_TASKFLOW
-#include <taskflow/taskflow.hpp>
-#endif
-
-#include "GBufferFillPassFeedback.h"
-#include "TextureCacheFeedback.h"
-
-using namespace donut::math;
-#include "feedbackmanager/include/feedbackmanager.h"
-#include "rtxts-ttm/tiledTextureManager.h"
-
-using namespace donut;
-using namespace donut::math;
-using namespace donut::app;
-using namespace donut::vfs;
-using namespace donut::engine;
-using namespace donut::render;
-
-using namespace nvfeedback;
-
+// Simple performance timer with max/average values for a number of samples
+// Used for CPU profiling
 class SimplePerf
 {
 public:
     SimplePerf() :
-        numSamples(0),
-        maxRunning(0),
-        maxStored(0)
+        m_maxValue(0.0),
+        m_sum(0.0),
+        m_maxNumSamples(100)
     {
     }
 
     void AddSample(double t)
     {
-        maxRunning = std::max(maxRunning, t);
-        numSamples++;
-        if (numSamples > 100)
-        {
-            maxStored = maxRunning;
-            numSamples = 0;
-            maxRunning = 0;
-        }
+        // Add the new sample
+        m_samples.push_back(t);
+        m_sum += t;
+        m_maxValue = std::max(m_maxValue, t);
+        LimitSampleCount();
     }
 
-    double GetMax()
+    double GetMax() const
     {
-        return maxStored;
+        return m_maxValue;
+    }
+
+    double GetAverage() const
+    {
+        return m_samples.empty() ? 0.0 : m_sum / (double)m_samples.size();
+    }
+
+    void SetMaxNumSamples(uint32_t maxNumSamples)
+    {
+        m_maxNumSamples = maxNumSamples;
+        LimitSampleCount();
     }
 
 private:
-    uint32_t numSamples;
-    double maxRunning;
-    double maxStored;
+    uint32_t m_maxNumSamples;
+    std::deque<double> m_samples;
+    double m_maxValue;
+    double m_sum;
+
+    void LimitSampleCount()
+    {
+        // Keep only the last m_maxNumSamples samples
+        bool newMaxNeeded = false;
+        
+        while (m_samples.size() > m_maxNumSamples)
+        {
+            double oldestSample = m_samples.front();
+            m_sum -= oldestSample;
+            m_samples.pop_front();
+            
+            // Find new maximum only if we removed the current max value
+            if (oldestSample == m_maxValue)
+            {
+                newMaxNeeded = true;
+            }
+        }
+
+        if (newMaxNeeded)
+        {
+            m_maxValue = 0.0;
+            for (const double& sample : m_samples)
+            {
+                m_maxValue = std::max(m_maxValue, sample);
+            }
+        }
+    }
 };
 
+// Render targets for the g-buffer pass
 class RenderTargets : public GBufferRenderTargets
 {
 public:
@@ -298,24 +338,19 @@ struct UIData
     std::string                         screenshotFileName;
     std::shared_ptr<SceneCamera>        activeSceneCamera;
     bool                                writeFeedback = true;
-    bool                                defragmentHeaps = true;
-    bool                                releaseEmptyHeaps = true;
+    bool                                useTextureSets = true;
+    bool                                compactMemory = false;
     bool                                showUnmappedRegions = false;
     bool                                enableStochasticFeedback = false;
     float                               feedbackProbabilityThreshold = 0.005f;
     bool                                enableDebug = false;
     int                                 texturesPerFrame = 10;
     int                                 tilesPerFrame = 256;
-    int                                 tileTimeout = 2;
-    int                                 maxStandbyTiles = 1000;
+    float                               tileTimeout = 1.0f;
+    int                                 numExtraStandbyTiles = 2000;
 };
 
-enum TextureState
-{
-    TextureState_Unloaded,
-    TextureState_Normal
-};
-
+// Helper class for uploading tiles to the GPU
 class TileUploadHelper
 {
 public:
@@ -337,10 +372,6 @@ public:
 
             m_uploadBuffers[i] = device->createBuffer(bufferDesc);
         }
-    }
-
-    ~TileUploadHelper()
-    {
     }
 
     void BeginFrame(uint32_t frameIndex)
@@ -429,6 +460,7 @@ struct RequestedTile
     uint32_t tileIndex;
 };
 
+// Main application class
 class SampleApp : public ApplicationBase
 {
 public:
@@ -480,7 +512,10 @@ public:
     UIData&                             m_ui;
 
     // Tiled resources & Sampler feedback
-    TextureState m_textureState;
+    bool m_recreateFeedbackTextures = true;
+    bool m_recreateFeedbackTextureSets = true;
+    bool m_textureSetsEnabled = false;
+    bool m_cameraCut = false;
     std::shared_ptr<FeedbackManager> m_feedbackManager;
     FeedbackTextureMaps m_feedbackTextureMaps;
     std::queue<RequestedTile> m_requestedTiles;
@@ -488,14 +523,12 @@ public:
 
     // Simple perf counters
     SimplePerf m_perfFeedbackBegin;
-    SimplePerf m_perfFeedbackUpdate;
-    SimplePerf m_perfFeedbackUpdateDxOnly;
+    SimplePerf m_perfFeedbackUpdateTileMappings;
     SimplePerf m_perfFeedbackResolve;
-    SimplePerf m_perfFeedbackResolveDxOnly;
 
     // GPU timing
-    std::vector<nvrhi::TimerQueryHandle> m_gbufferTimerQueries;
-    float m_gbufferTime;
+    AveragingTimerQuery m_timerGbuffer;
+    AveragingTimerQuery m_timerResolve;
 
 public:
 
@@ -503,8 +536,9 @@ public:
         : Super(deviceManager)
         , m_ui(ui)
         , m_bindingCache(deviceManager->GetDevice())
-        , m_textureState(TextureState_Unloaded)
         , m_tileUploadHelper(deviceManager->GetDevice(), m_ui.tilesPerFrame, deviceManager->GetBackBufferCount())
+        , m_timerGbuffer(deviceManager->GetDevice())
+        , m_timerResolve(deviceManager->GetDevice())
     { 
         std::shared_ptr<NativeFileSystem> nativeFS = std::make_shared<NativeFileSystem>();
 
@@ -561,13 +595,11 @@ public:
 
         SetAsynchronousLoadingEnabled(true);
 
+        // Load default scene if not provided
         if (sceneName.empty())
             SetCurrentSceneName(app::FindPreferredScene(m_sceneFilesAvailable, "media/Bistro.scene.json"));
         else
             SetCurrentSceneName("/native/" + sceneName);
-
-        for (uint32_t i = 0; i < GetDeviceManager()->GetBackBufferCount(); i++)
-            m_gbufferTimerQueries.push_back(GetDevice()->createTimerQuery());
     }
 
     std::shared_ptr<vfs::IFileSystem> GetRootFs() const
@@ -700,11 +732,12 @@ public:
         m_sunLight.reset();
         m_ui.selectedMaterial = nullptr;
         m_ui.selectedNode = nullptr;
+        m_feedbackTextureMaps.m_feedbackTextureSetsByMaterial.clear();
         m_feedbackTextureMaps.m_feedbackTexturesByFeedback.clear();
         m_feedbackTextureMaps.m_feedbackTexturesByName.clear();
         m_feedbackTextureMaps.m_feedbackTexturesBySource.clear();
+        m_feedbackTextureMaps.m_materialConstantsFeedback.clear();
         m_requestedTiles = {};
-        m_textureState = TextureState_Unloaded;
 
         m_feedbackManager.reset();
     }
@@ -777,10 +810,12 @@ public:
 
         FeedbackManagerDesc fmDesc = {};
         fmDesc.numFramesInFlight = GetDeviceManager()->GetBackBufferCount();
-        // Relatively small heap size for demonstration purposes
-        // A larger heap size could be more efficient
-        fmDesc.heapSizeInTiles = 128;
+        fmDesc.heapSizeInTiles = 1024; // 64MiB heap size
         m_feedbackManager = std::shared_ptr<FeedbackManager>(CreateFeedbackManager(GetDevice(), fmDesc));
+
+        m_recreateFeedbackTextures = true;
+        m_recreateFeedbackTextureSets = true;
+        m_cameraCut = true;
 
         CopyActiveCameraToFirstPerson();
     }
@@ -916,10 +951,12 @@ public:
         GetDeviceManager()->SetVsyncEnabled(true);
     }
 
-    void EnsureTextures()
+    // Make sure before rendering that all feedback textures have been created
+    void EnsureFeedbackTextures()
     {
-        if (m_textureState == TextureState_Normal)
+        if (!m_recreateFeedbackTextures)
             return;
+        m_recreateFeedbackTextures = false;
 
         nvrhi::DeviceHandle device = GetDevice();
         device->waitForIdle();
@@ -931,7 +968,7 @@ public:
         m_feedbackTextureMaps.m_feedbackTexturesByFeedback.clear();
         m_feedbackTextureMaps.m_feedbackTexturesByName.clear();
         m_feedbackTextureMaps.m_feedbackTexturesBySource.clear();
-        m_textureState = TextureState_Normal;
+        m_feedbackTextureMaps.m_materialConstantsFeedback.clear();
 
         // Generate all the reserved and feedback textures
 
@@ -1006,27 +1043,187 @@ public:
         }
     }
 
+    // After all feedback textures have been created, create texture sets if enabled
+    void EnsureTextureSets()
+    {
+        if (m_ui.useTextureSets != m_textureSetsEnabled)
+        {
+            m_textureSetsEnabled = m_ui.useTextureSets;
+            m_recreateFeedbackTextureSets = true;
+        }
+
+        if (!m_recreateFeedbackTextureSets)
+            return;
+            
+        m_recreateFeedbackTextureSets = false;
+
+        nvrhi::DeviceHandle device = GetDevice();
+        device->waitForIdle();
+        device->runGarbageCollection();
+
+        log::info("Clearing texture sets");
+        m_feedbackTextureMaps.m_feedbackTextureSetsByMaterial.clear();
+        m_feedbackTextureMaps.m_materialConstantsFeedback.clear();
+
+        if (m_gBufferPass) m_gBufferPass->ResetBindingCache();
+        if (m_gBufferReadDepthPass) m_gBufferReadDepthPass->ResetBindingCache();
+
+        auto& materials = GetScene()->GetSceneGraph()->GetMaterials();
+        if (m_ui.useTextureSets)
+        {
+            // Now construct texture sets, one per material
+            for (auto& material : materials)
+            {
+                if (!material->baseOrDiffuseTexture)
+                {
+                    // Texture sets are only supported for materials with a diffuse texture due to pairing in the shader
+                    continue;
+                }
+
+                if (m_feedbackTextureMaps.m_feedbackTexturesBySource.find(material->baseOrDiffuseTexture.get()) == m_feedbackTextureMaps.m_feedbackTexturesBySource.end())
+                {
+                    // This material does not have feedback textures
+                    continue;
+                }
+
+                nvrhi::RefCountPtr<FeedbackTextureSet> textureSet;
+                m_feedbackManager->CreateTextureSet(&textureSet);
+
+                auto addTextureToSet = [&](const std::shared_ptr<LoadedTexture>& texture) {
+                    if (!texture) return;
+                    auto it = m_feedbackTextureMaps.m_feedbackTexturesBySource.find(texture.get());
+                    if (it != m_feedbackTextureMaps.m_feedbackTexturesBySource.end())
+                    {
+                        textureSet->AddTexture(it->second->m_feedbackTexture);
+                    }
+                };
+
+                // Add the diffuse texture first, which is currently always the primary texture
+                addTextureToSet(material->baseOrDiffuseTexture);
+                addTextureToSet(material->metalRoughOrSpecularTexture); 
+                addTextureToSet(material->normalTexture);
+                addTextureToSet(material->emissiveTexture);
+                addTextureToSet(material->occlusionTexture);
+                addTextureToSet(material->transmissionTexture);
+                addTextureToSet(material->opacityTexture);
+
+                // Do one more check to ensure no follower textures are larger than the primary texture
+                bool rejectTextureSet = false;
+                auto primaryTexture = textureSet->GetPrimaryTexture()->GetReservedTexture();
+                uint32_t primaryWidth = primaryTexture->getDesc().width;
+                uint32_t primaryHeight = primaryTexture->getDesc().height;
+                uint32_t primaryMipLevels = primaryTexture->getDesc().mipLevels;
+                uint32_t numTextures = textureSet->GetNumTextures();
+                for (uint32_t i = 0; i < numTextures; i++)
+                {
+                    auto followerTexture = textureSet->GetTexture(i)->GetReservedTexture();
+                    uint32_t width = followerTexture->getDesc().width;
+                    uint32_t height = followerTexture->getDesc().height;
+                    uint32_t mipLevels = followerTexture->getDesc().mipLevels;
+
+                    if (width > primaryWidth || height > primaryHeight || mipLevels > primaryMipLevels)
+                    {
+                        // Reject this texture set because it has a follower texture that is larger than the primary texture
+                        rejectTextureSet = true;
+                        break;
+                    }
+                }
+
+                if (rejectTextureSet)
+                    continue; // Reject the texture set, its destructor will clean up state in FeedbackTextures
+
+                // Store the texture set, and the map from material to texture set
+                m_feedbackTextureMaps.m_feedbackTextureSetsByMaterial[material.get()] = textureSet;
+            }
+            log::info("Created %d texture sets", m_feedbackTextureMaps.m_feedbackTextureSetsByMaterial.size());
+        }
+
+        // Now create the FeedbackConstants constant buffers, one per material
+        {
+            nvrhi::CommandListHandle commandList = device->createCommandList();
+            commandList->open();
+
+            for (auto& material : materials)
+            {
+                nvrhi::BufferDesc bufferDesc;
+                bufferDesc.byteSize = sizeof(FeedbackConstants);
+                bufferDesc.debugName = material->name + "_FeedbackConstants";
+                bufferDesc.isConstantBuffer = true;
+                bufferDesc.initialState = nvrhi::ResourceStates::ConstantBuffer;
+                bufferDesc.keepInitialState = true;
+                bufferDesc.isVirtual = false;
+                nvrhi::BufferHandle cb = device->createBuffer(bufferDesc);
+
+                // Check if this material is using a texture set by looking it up in the map
+                bool useTextureSet = m_feedbackTextureMaps.m_feedbackTextureSetsByMaterial.find(material.get()) != m_feedbackTextureMaps.m_feedbackTextureSetsByMaterial.end();
+
+                FeedbackConstants feedbackConstants;
+                feedbackConstants.useTextureSet = useTextureSet;
+                commandList->writeBuffer(cb, &feedbackConstants, sizeof(FeedbackConstants));
+
+                // Store the constant buffer in the map
+                m_feedbackTextureMaps.m_materialConstantsFeedback[material.get()] = cb;
+            }
+
+            commandList->close();
+            device->executeCommandList(commandList);
+        }
+
+        // Just for information, count textures with and without texture sets, and also how many textures are "primary"
+        size_t texturesWithSets = 0;
+        size_t texturesWithoutSets = 0;
+        std::set<nvfeedback::FeedbackTexture*> uniquePrimaryTextures;
+        for (const auto& pair : m_feedbackTextureMaps.m_feedbackTexturesByFeedback)
+        {
+            nvfeedback::FeedbackTexture* feedbackTexture = pair.first;
+            if (feedbackTexture->GetNumTextureSets() > 0)
+            {
+                texturesWithSets++;
+                for (uint32_t i = 0; i < feedbackTexture->GetNumTextureSets(); i++) 
+                {
+                    nvfeedback::FeedbackTextureSet* textureSet = feedbackTexture->GetTextureSet(i);
+                    uniquePrimaryTextures.insert(textureSet->GetPrimaryTexture());
+                }
+            }
+            else
+            {
+                texturesWithoutSets++;
+            }
+        }
+        log::info("Feedback textures with texture sets: %zu", texturesWithSets);
+        log::info("Feedback textures without texture sets: %zu", texturesWithoutSets);
+        log::info("Unique primary textures: %zu", uniquePrimaryTextures.size());
+    }
+
+    // At the beginning of the frame, read back and process sampler feedback
     void ProcessFeedbackBeforeRender()
     {
-        // Begin with sampler feedback and tile streaming
-        m_tileUploadHelper.BeginFrame(GetFrameIndex());
         nvrhi::DeviceHandle device = GetDevice();
 
+        m_tileUploadHelper.BeginFrame(GetFrameIndex());
+
         // Collection of packed tiles requested, typically right after loading a scene
+        // These always get uploaded using the slower but more flexible packed mip codepath
         std::vector<RequestedTile> requestedPackedTiles;
 
+        // Begin frame, readback feedback
         {
             m_commandList->open();
 
-            // Begin frame, readback feedback
             FeedbackTextureCollection updatedTextures = {};
             FeedbackUpdateConfig fconfig = {};
             fconfig.frameIndex = GetDeviceManager()->GetCurrentBackBufferIndex();
             fconfig.maxTexturesToUpdate = std::max(m_ui.texturesPerFrame, 0);
-            fconfig.tileTimeoutSeconds = (float)std::max(m_ui.tileTimeout, 0);
-            fconfig.defragmentHeaps = m_ui.defragmentHeaps;
-            fconfig.releaseEmptyHeaps = m_ui.releaseEmptyHeaps;
-            fconfig.maxStandbyTiles = m_ui.maxStandbyTiles;
+            fconfig.tileTimeoutSeconds = std::max(m_ui.tileTimeout, 0.0f);
+            fconfig.defragmentHeaps = m_ui.compactMemory;
+            fconfig.trimStandbyTiles = m_ui.compactMemory;
+            fconfig.releaseEmptyHeaps = m_ui.compactMemory;
+            fconfig.numExtraStandbyTiles = m_ui.numExtraStandbyTiles;
+            if (m_cameraCut)
+            {
+                fconfig.maxTexturesToUpdate = 0;
+                m_cameraCut = false;
+            }
             m_feedbackManager->BeginFrame(m_commandList, fconfig, &updatedTextures);
 
             // Collect all tiles and store them in the queue
@@ -1101,6 +1298,9 @@ public:
             m_feedbackManager->UpdateTileMappings(m_commandList, &tilesThisFrame);
 
             m_commandList->close();
+
+            // Execute the command list here
+            // This synchronizes the command lists work before and after calling the UpdateTileMappings API
             GetDevice()->executeCommandList(m_commandList);
         }
 
@@ -1165,12 +1365,15 @@ public:
         }
     }
 
+    // After rendering, resolve feedback and do some housekeeping
     void ProcessFeedbackAfterRender()
     {
         m_commandList->open();
 
         // Resolve feedback after rendering
+        m_timerResolve.beginQuery(m_commandList);
         m_feedbackManager->ResolveFeedback(m_commandList);
+        m_timerResolve.endQuery(m_commandList);
 
         // End frame logic
         m_feedbackManager->EndFrame();
@@ -1181,21 +1384,32 @@ public:
         // Update CPU time stats
         FeedbackManagerStats stats = m_feedbackManager->GetStats();
         m_perfFeedbackBegin.AddSample(stats.cputimeBeginFrame);
-        m_perfFeedbackUpdate.AddSample(stats.cputimeUpdateTileMappings);
-        m_perfFeedbackUpdateDxOnly.AddSample(stats.cputimeDxUpdateTileMappings);
+        m_perfFeedbackUpdateTileMappings.AddSample(stats.cputimeUpdateTileMappings);
         m_perfFeedbackResolve.AddSample(stats.cputimeResolve);
-        m_perfFeedbackResolveDxOnly.AddSample(stats.cputimeDxResolve);
+
+        // Get frames per second and adjust max num samples to roughly match it
+        float const frameTime = (float)GetDeviceManager()->GetAverageFrameTimeSeconds();
+        float const framesPerSecond = (frameTime > 0.f) ? 1.f / frameTime : 0.f;
+        uint32_t newMaxNumSamples = std::clamp((uint32_t)framesPerSecond, 1U, 1000U);
+
+        m_perfFeedbackBegin.SetMaxNumSamples(newMaxNumSamples);
+        m_perfFeedbackUpdateTileMappings.SetMaxNumSamples(newMaxNumSamples);
+        m_perfFeedbackResolve.SetMaxNumSamples(newMaxNumSamples);
     }
 
+    // Main render function
     virtual void RenderScene(nvrhi::IFramebuffer* framebuffer) override
     {
         // Make sure feedback textures are created
-        EnsureTextures();
+        EnsureFeedbackTextures();
+
+        // Make sure texture sets are created
+        EnsureTextureSets();
 
         // Perform all the feedback/tiled code before rendering the frame
         ProcessFeedbackBeforeRender();
 
-        // Render the frame
+        // Begin rendering the frame
         int windowWidth, windowHeight;
         GetDeviceManager()->GetWindowDimensions(windowWidth, windowHeight);
         nvrhi::Viewport windowViewport = nvrhi::Viewport(float(windowWidth), float(windowHeight));
@@ -1205,6 +1419,7 @@ public:
 
         bool exposureResetRequired = false;
 
+        // Create render passes if needed
         {
             uint width = windowWidth;
             uint height = windowHeight;
@@ -1238,6 +1453,7 @@ public:
             m_ui.shaderReloadRequested = false;
         }
 
+        // Open the command list for rendering
         m_commandList->open();
 
         m_scene->RefreshBuffers(m_commandList, GetFrameIndex());
@@ -1247,6 +1463,8 @@ public:
 
         m_ambientTop = m_ui.ambientIntensity * m_ui.skyParams.skyColor * m_ui.skyParams.brightness;
         m_ambientBottom = m_ui.ambientIntensity * m_ui.skyParams.groundColor * m_ui.skyParams.brightness;
+
+        // Render shadows
         if (m_ui.enableShadows)
         {
             m_sunLight->shadowMap = m_shadowMap;
@@ -1292,16 +1510,11 @@ public:
             m_forwardPass->PrepareLights(forwardContext, m_commandList, m_scene->GetSceneGraph()->GetLights(), m_ambientTop, m_ambientBottom, lightProbes);
         }
 
-        // Gbuffer pass
+        // Gbuffer pass with sampler feedback
         {
             uint32_t backBufferIndex = GetDeviceManager()->GetCurrentBackBufferIndex();
 
-            if (GetDevice()->pollTimerQuery(m_gbufferTimerQueries[backBufferIndex]))
-            {
-                m_gbufferTime = GetDevice()->getTimerQueryTime(m_gbufferTimerQueries[backBufferIndex]);
-            }
-
-            m_commandList->beginTimerQuery(m_gbufferTimerQueries[backBufferIndex]);
+            m_timerGbuffer.beginQuery(m_commandList);
 
             auto* gBufferPass = m_gBufferPass.get();
             GBufferFillPassFeedback::Context gBufferFillPassFeedbackContext;
@@ -1320,7 +1533,7 @@ public:
                 "GBufferFill",
                 m_ui.enableMaterialEvents);
 
-            m_commandList->endTimerQuery(m_gbufferTimerQueries[backBufferIndex]);
+            m_timerGbuffer.endQuery(m_commandList);
 
             nvrhi::ITexture* ambientOcclusionTarget = nullptr;
             if (m_ui.enableSsao && m_ssaoPass)
@@ -1341,6 +1554,7 @@ public:
             m_deferredLightingPass->Render(m_commandList, *m_view, deferredInputs);
         }
 
+        // User requested to pick which material is under the cursor
         if (m_pick)
         {
             m_commandList->clearTextureUInt(m_renderTargets->materialIDs, nvrhi::AllSubresources, 0xffff);
@@ -1389,6 +1603,7 @@ public:
 
         nvrhi::ITexture* finalHdrColor = m_renderTargets->hdrColor;
 
+        // TAA or regular HDR resolve
         if (m_ui.antiAliasingMode == AntiAliasingMode::TEMPORAL)
         {
             if (m_previousViewsValid)
@@ -1469,9 +1684,15 @@ public:
             }
         }
 
+        // Close the main render commandlist and execute it
         m_commandList->close();
         GetDevice()->executeCommandList(m_commandList);
 
+        // Update the GPU timers
+        m_timerGbuffer.update();
+        m_timerResolve.update();
+
+        // Now that the frame is rendered, resolve sampler feedback
         ProcessFeedbackAfterRender();
 
         if (!m_ui.screenshotFileName.empty())
@@ -1518,6 +1739,7 @@ public:
     }
 };
 
+// UI renderer for the application
 class UIRenderer : public ImGui_Renderer
 {
 private:
@@ -1581,9 +1803,22 @@ protected:
         ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), 0);
         ImGui::Begin("Settings", 0, ImGuiWindowFlags_AlwaysAutoResize);
         ImGui::Text("Renderer: %s, %s", GetDeviceManager()->GetRendererString(), resolution.c_str());
-        double frameTime = GetDeviceManager()->GetAverageFrameTimeSeconds();
-        if (frameTime > 0.0)
-            ImGui::Text("%.3f ms/frame (%.1f FPS)", frameTime * 1e3, 1.0 / frameTime);
+
+        float const frameTime = (float)GetDeviceManager()->GetAverageFrameTimeSeconds();
+        float const framesPerSecond = (frameTime > 0.f) ? 1.f / frameTime : 0.f;
+        ImGui::Text("Frame Time: %.2f ms %.1f FPS (CPU)", frameTime * 1000.0f, framesPerSecond);
+
+        auto renderTime = m_app->m_timerGbuffer.getAverageTime();
+        if (renderTime.has_value())
+        {
+            ImGui::Text("G-Buffer Pass: %.2f ms (GPU)", renderTime.value() * 1e3f);
+        }
+
+        auto resolveTime = m_app->m_timerResolve.getAverageTime();
+        if (resolveTime.has_value())
+        {
+            ImGui::Text("Resolve Pass: %.2f ms (GPU)", resolveTime.value() * 1e3f);
+        }
 
         const std::string currentScene = m_app->GetCurrentSceneName();
         if (ImGui::BeginCombo("Scene", currentScene.c_str()))
@@ -1606,6 +1841,19 @@ protected:
 #endif // _DEBUG
 
         ImGui::Checkbox("VSync", &m_ui.enableVsync);
+
+        if (ImGui::CollapsingHeader("CPU Profiling"))
+        {
+            double tBeginMax = m_app->m_perfFeedbackBegin.GetMax();
+            double tBeginAvg = m_app->m_perfFeedbackBegin.GetAverage();
+            double tUpdateTileMappingsMax = m_app->m_perfFeedbackUpdateTileMappings.GetMax();
+            double tUpdateTileMappingsAvg = m_app->m_perfFeedbackUpdateTileMappings.GetAverage();
+            double tResolveMax = m_app->m_perfFeedbackResolve.GetMax();
+            double tResolveAvg = m_app->m_perfFeedbackResolve.GetAverage();
+            ImGui::Text("BeginFrame max: %.3f ms, avg: %.3f ms", tBeginMax * 1e3, tBeginAvg * 1e3);
+            ImGui::Text("UpdateTileMappings max: %.3f ms, avg: %.3f ms", tUpdateTileMappingsMax * 1e3, tUpdateTileMappingsAvg * 1e3);
+            ImGui::Text("Resolve max: %.3f ms, avg: %.3f ms", tResolveMax * 1e3, tResolveAvg * 1e3);
+        }
 
 #if _DEBUG
         if (ImGui::CollapsingHeader("Rendering Settings"))
@@ -1645,8 +1893,8 @@ protected:
 
         ImGui::Separator();
         ImGui::Checkbox("Write Feedback", &m_ui.writeFeedback);
-        ImGui::Checkbox("Defragment Heaps", &m_ui.defragmentHeaps);
-        ImGui::Checkbox("Release Empty Heaps", &m_ui.releaseEmptyHeaps);
+        ImGui::Checkbox("Use Texture Sets", &m_ui.useTextureSets);
+        ImGui::Checkbox("Compact memory (pause/loading screen)", &m_ui.compactMemory);
 
         ImGui::Checkbox("Highlight Unmapped Regions", &m_ui.showUnmappedRegions);
         ImGui::Checkbox("Enable Stochastic Feedback", &m_ui.enableStochasticFeedback);
@@ -1657,8 +1905,8 @@ protected:
 
         ImGui::SliderInt("Textures Per Frame", &m_ui.texturesPerFrame, 0, 32);
         ImGui::SliderInt("Tiles Per Frame", &m_ui.tilesPerFrame, 1, 100);
-        ImGui::SliderInt("Tile Timeout Seconds", &m_ui.tileTimeout, 0, 10);
-        ImGui::SliderInt("Max Standby Tiles", &m_ui.maxStandbyTiles, 0, 2000);
+        ImGui::SliderFloat("Tile Timeout Seconds", &m_ui.tileTimeout, 0, 1.0f);
+        ImGui::SliderInt("Extra Standby Tiles", &m_ui.numExtraStandbyTiles, 0, 2000);
 
         ImGui::Separator();
         constexpr double mebibyte = 1024 * 1024;
@@ -1667,13 +1915,10 @@ protected:
         ImGui::Text("Tiles Total: %d (%.0f MiB)", stats.tilesTotal, tilesTotalMibs);
         ImGui::Text("Tiles Allocated: %d (%.0f MiB)", stats.tilesAllocated, double(uint64_t(stats.tilesAllocated) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte);
         ImGui::Text("Tiles Standby: %d (%.0f MiB)", stats.tilesStandby, double(uint64_t(stats.tilesStandby) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte);
-#if PROFILE
-        ImGui::Text("Tiles Requested: %d (%.0f MiB)", stats.tilesRequested, double(uint64_t(stats.tilesRequested) * uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte);
-        ImGui::Text("Tiles Idle: %d", stats.tilesIdle);
-#endif // PROFILE
         double tilesHeapAllocatedMib = double(stats.heapAllocationInBytes) / mebibyte;
         ImGui::Text("Heap Allocation: %.0f MiB", tilesHeapAllocatedMib);
-        
+        ImGui::Text("Heap Free Tiles: %d (%.0f MiB)", stats.heapTilesFree, double(uint64_t(stats.heapTilesFree)* uint64_t(D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)) / mebibyte);
+
         ImGui::Separator();
 
         if (stats.tilesTotal)
@@ -1688,27 +1933,6 @@ protected:
             ImGui::Text("No tiled resources Loaded\nOnly scenes with block-compressed textures are currently supported");
             ImGui::PopStyleColor();
         }
-
-#if PROFILE
-        ImGui::Separator();
-        double tGbuffer = m_app->m_gbufferTime;
-        ImGui::Text("GBuffer Render: %.3f ms", tGbuffer * 1e3);
-
-        ImGui::Separator();
-        double tBegin = m_app->m_perfFeedbackBegin.GetMax();
-        double tUpdate = m_app->m_perfFeedbackUpdate.GetMax();
-        double tUpdateDxOnly = m_app->m_perfFeedbackUpdateDxOnly.GetMax();
-        double tResolve = m_app->m_perfFeedbackResolve.GetMax();
-        double tResolveDxOnly = m_app->m_perfFeedbackResolveDxOnly.GetMax();
-        ImGui::Text("BeginFrame: %.3f ms", tBegin * 1e3);
-        ImGui::Text("UpdateTileMappings: %.3f ms", tUpdate * 1e3);
-        ImGui::Text("Resolve: %.3f ms", tResolve * 1e3);
-        ImGui::Text("Sum: %.3f ms", (tBegin + tUpdate + tResolve) * 1e3);
-        ImGui::Text("UpdateTileMappings DxOnly: %.3f ms", tUpdateDxOnly * 1e3);
-        ImGui::Text("Resolve DxOnly: %.3f ms", tResolveDxOnly * 1e3);
-        ImGui::Text("Sum DxOnly: %.3f ms", (tUpdateDxOnly + tResolveDxOnly) * 1e3);
-        PROFILE
-#endif // PROFILE
 
         ImGui::Separator();
         ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 0, 255));
